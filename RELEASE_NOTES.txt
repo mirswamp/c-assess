@@ -1,0 +1,390 @@
+-------------------------------------
+C-assess  version 1.1.7 (Apr 10, 2017)
+-------------------------------------
+- put platform name and uuid, and package name and version in xml files
+- support all C escape codes for unescaping
+- add support for new resultparser weakness file format (status and long message)
+
+-------------------------------------
+C-assess  version 1.1.6 (Feb 08, 2017)
+-------------------------------------
+- CodeSonar results now use the analysis*.xml file instead of the
+  warning directory
+- warnings are now in the directory path pointed to analysis*.xml
+  file with the leading '/' removed
+- for CodeSonar assessment specify the compiler type if it is not gcc
+  or g++
+
+-------------------------------------
+C-assess  version 1.1.5 (Jan 17, 2017)
+-------------------------------------
+- make gt-csonar work with version 4.4p0
+- fixed build-root-dir and package-root-dir in
+  {build,assessment}_summary.xml files
+- fixed assessCmds.sh generation to deal with BASH_FUNC_name() and
+  BASH_FUNC_%% environment variables that are exported Bash functions
+
+-------------------------------------
+C-assess  version 1.1.4 (Oct 23, 2016)
+-------------------------------------
+- add support for 'internet-inaccessible' in run.conf
+
+-------------------------------------
+C-assess  version 1.1.3 (Oct 19, 2016)
+-------------------------------------
+- emit 'tool-package-compatibility (gcc version)' if Parasoft C/C++test is
+  incompatible with the version of gcc used during the build
+
+-------------------------------------
+C-assess  version 1.1.2 (Oct 13, 2016)
+-------------------------------------
+- changed task network-failure to network in status.out
+
+-------------------------------------
+C-assess  version 1.1.1 (Oct 05, 2016)
+-------------------------------------
+- add new tasks for chdir'ing and mkdir'ing that are only present
+  on failure: chdir-package-dir, chdir-build-dir, chdir-config-dir,
+  and chdir-misc; along with mkdir-* versions
+- no files found to assess is now SKIP instead of FAIL
+- gcc warn no longer FAILs on non-0 exit status (error codes exit non-0)
+- added defines and undefs to build_summary.xml
+- get preprocessor defines and undefs from -Wp,-D... and -Wp,-U...
+- allow libaries besided source files with gcc -c such as
+  gcc -c -o a.o a.c -lcrypto
+- no longer dump the data to debuginfo, making it considerably smaller
+- if build fails, do not archive results
+
+-------------------------------------
+C-assess  version 1.1.0 (Aug 19, 2016)
+-------------------------------------
+- add support for .xz archives on new platforms
+
+-------------------------------------
+C-assess  version 1.0.9 (Jul 19, 2016)
+-------------------------------------
+- add support for new platforms
+- add better checking for network failures
+
+-------------------------------------
+C-assess  version 1.0.8 (Feb 29, 2016)
+-------------------------------------
+- handle input of stdin (-)
+- ignore gcc commands where -T <linker-script-file> is missing 
+- changed strace archive from .tar.gz to .tar
+- changed directory structure to place in-files and swamp-conf in a
+  platform directory (currently noarch) to match tools, other frameworks
+  and the resultparser
+- use common script between all the frameworks to get the platform and
+  the install OS dependencies, fixes EPEL on old platforms
+
+-------------------------------------
+C-assess  version 1.0.7 (Feb 10, 2016)
+-------------------------------------
+- fixed bug in ExecCmd, where a modified ENV failed to be set when  specified
+
+-------------------------------------
+C-assess  version 1.0.6 (Feb 09, 2016)
+-------------------------------------
+- add support for setting LANG environment in config file for metric tools
+
+-------------------------------------
+C-assess  version 1.0.5 (Feb 03, 2016)
+-------------------------------------
+- fix getting the distro and version using lsb_release
+- support for code metric tools: cloc and lizard
+
+-------------------------------------
+C-assess  version 1.0.4 (Oct 13, 2015)
+-------------------------------------
+- support for .xz archives on scientific-5.9 platforms
+- support for cppcheck options in tool.conf
+- support for (pre-built software) components to installed
+- when generating conf file, support multiline and whitespace
+
+-------------------------------------
+C-assess  version 1.0.3 (Oct 05, 2015)
+-------------------------------------
+- support for cppcheck options in tool.conf
+
+-------------------------------------
+C-assess  version 1.0.2 (Sep 02, 2015)
+-------------------------------------
+- make Bash script generated for Goanna and CodeSonar assessment
+  compatible with Bash 3.x
+
+-------------------------------------
+C-assess  version 1.0.1 (Aug 26, 2015)
+-------------------------------------
+- check for license acquire failures for Goanna
+
+-------------------------------------
+C-assess  version 1.0.0 (Aug 24, 2015)
+-------------------------------------
+- support for Red Lizard Goanna
+
+-------------------------------------
+C-assess  version 0.9.8 (May 23, 2015)
+-------------------------------------
+- fix bug related to builds where threads are used
+- for GrammaTech CodeSonar assessments, use hub-info to get the license
+  status
+
+-------------------------------------
+C-assess  version 0.9.7 (Apr 19, 2015)
+-------------------------------------
+- unarchive package in build/pkg1 instead of build
+- build tools (gcc, ld, ...) can be in any directory, use only the file
+  name to determine the type of tool
+- fix parsing of gcc -include option (affected cppcheck)
+- include macro definition in -D's unless it is exactly "1":
+    #define F          -DF=
+    #define G 1        -DG
+    #define H 2        -DH=2
+- if there is no file extension, set type to 'other' for gcc files
+  to fix incorrect behavior
+- process gcc's -e option correctly (requires a parameter)
+- ignore resumed futex's that were never suspended from strace; they
+  are likely do to a clone event with locks held, and released by the
+  kernel due to thread scheduling
+- changed order of attributes for a command in XML output to
+  (cwd, env, exec, args) from (cwd, exec, args, env).
+- unarchive results parser into ~/results-parser directory instead of ~
+- task name fix:  resultparser-unarchiver -> resultparser-unarchive
+- print strace path and version of stracebin, not strace path path
+- add support for GrammaTech CodeSonar
+- correctly handle threads, and clone flags CLONE_FS and CLONE_FILES
+- write out debuginfo file in more cases to allow debugging
+- support for installing and using strace version on platform and
+  instructing buildbug to use the installed version
+- make PWD environment variable reflect the current working directory
+  after changing directories
+
+-------------------------------------
+C-assess  version 0.9.6 (Jan 27, 2015)
+-------------------------------------
+- for gcc-warn, add -fdiagnostic-show-option, so the result parser
+  has a bug code to use for gcc compiler versions 4.1.x to 4.5.x.
+  It is the default starting with gcc 4.6.x.
+
+-------------------------------------
+C-assess  version 0.9.5 (Jan  5, 2015)
+-------------------------------------
+- enhanced configuration file format to allow arbitrary whitespace
+  -   k :=v   assigns all the characters of v to k up to the new-line
+  -   k :nL=v assigns the next n lines starting with v including all
+              new-lines expect the final new-line
+  -   k :=v   same as 'k :1L=v'
+  -   k :nC=v assigns the next n characters starting with v including
+              all new-line characters.
+
+-------------------------------------
+C-assess  version 0.9.4 (Dec 15, 2014)
+-------------------------------------
+- change HRL TIF tool operation to not run the compiler as linker.
+  TIF sometimes fails to link without error, and does not currently
+  need the link step to produce output.
+
+-------------------------------------
+C-assess  version 0.9.3 (Dec 12, 2014)
+-------------------------------------
+- add support for HRL TIF tool
+
+-------------------------------------
+C-assess  version 0.9.2 (Nov 13, 2014)
+-------------------------------------
+- added new task 'assess-aquire-license' in status.out:  a FAIL value
+  indicates that a license was not able to be acquired (the license
+  server was down or no licenses were available).  This task may not
+  be present for tools that have no license, or for successful license
+  acquisition.
+
+-------------------------------------
+C-assess  version 0.9.1 (Nov 04, 2014)
+-------------------------------------
+- bug fix for Parasoft C/C++test for some project that use g++
+
+-------------------------------------
+C-assess  version 0.9.0 (Nov 03, 2014)
+-------------------------------------
+- Support for Parasoft C/C++test tool (requires services.conf configuration
+  file, see README-c-assess.txt for details)
+- fix exception handling so failures are propaged to 'all' in status.out
+- rethrow if "$@ ne ''" not just "$@"
+- add HasValue function to check for defined and not empty
+- add tool-install-cmd code
+- pass --toolconf, --tooldir to buildbug
+- rename MakeAbsPath to ConcatPaths, make more robust, use more places
+- refactor using HasValue
+
+-------------------------------------
+C-assess  version 0.8.9 (Sep xx, 2014)
+-------------------------------------
+- add .war, .ear, and .rar archive format support
+- do not use a shell where unnecessary
+- allow build command of an arbitrary shell string (multiple commands, ...)
+- allow arbitrary characters in user supplied file names (leading and
+  trailing spaces and internal new lines are not allowed in the conf file
+  yet)
+- log ifconfig from run.sh to record the status of the network
+
+-------------------------------------
+C-assess  version 0.8.8 (Aug 28, 2014)
+-------------------------------------
+- support for build-sys of no-build
+- add support for .jar archives
+
+-------------------------------------
+C-assess  version 0.8.7 (Aug 27, 2014)
+-------------------------------------
+- workaround strace behavior where it does not print _exit or exit_group
+  for a pid, but pid is returned to wait4/waitpid indicating exit
+
+-------------------------------------
+C-assess  version 0.8.6 (Aug 25, 2014)
+-------------------------------------
+- workaround strace behavior where it does not print killed message for
+  a pid, but pid is returned to wait4/waitpid indicating exit
+- workaround strace behavior of old versions of strace where it does
+  not exit in the same way as the traced process, detect after
+  processing strace file, the build-trace-decode task will fail with a
+  short message of 'build', and a long message of the build command and
+  failure reason
+- if proc exits by signal, propagate to all applicable eids
+- add the full set of gcc file extension to file type mappings
+- when creating the buildCmd.sh, do not include diagnostic gcc commands
+
+
+-------------------------------------
+C-assess  version 0.8.5 (Aug  5, 2014)
+-------------------------------------
+- When creating buildCmds.sh for clang-sa assessment, do not include
+  gcc commands where an input file does not exist (from configure
+  activities present in the monitored build)
+
+
+-------------------------------------
+C-assess  version 0.8.4 (Aug  2, 2014)
+-------------------------------------
+- If assessment fails, print error to stderr
+- If assessment fails, archive the results directory
+
+
+-------------------------------------
+C-assess  version 0.8.3 (Apr 23, 2014)
+-------------------------------------
+- Added four new options to run-params.conf; SWAMP_PASSWORD_IS_ENCRYPTED,
+  USER_CONF, ROOT_PAYLOAD, and USER_PAYLOAD
+- SWAMP_PASSWORD is now optional.  If not set, no password is set.
+
+
+-------------------------------------
+C-assess  version 0.8.2 (Feb 13, 2014)
+-------------------------------------
+- in status.out, make the task 'all' FAIL, if any task buildbug FAILs.
+
+
+-------------------------------------
+C-assess  version 0.8.1 (Feb 11, 2014)
+-------------------------------------
+- change directory structure to add swamp-conf directory containing
+  sys-os-dependencies.conf
+- better V2 VM support
+- minor bug fixes
+
+
+-------------------------------------
+C-assess  version 0.8.0 (Jan 27, 2014)
+-------------------------------------
+- add support for goals: 'build+assess+parse' and 'parse'. These will
+  generate parsed results and part of the assessment workflow, or from
+  previously generated results respectively.  The files
+  resultparser.conf and resultparser archive are required to be in the
+  $VMINPUTDIR.
+- Initial support for V2 VMs (not completely tested).
+- run-overrides.conf is deprecated and replaced with run-params.conf
+- run-params.conf variables MY_USERNAME, MY_USERID and MY_PASSWORD
+  are deprecated and replaced with SWAMP_USERNAME, SWAMP_USERID and
+  SWAMP_PASSWORD respectively.
+- release directory structure has changed:  the files that need to
+  placed in the input directory are all now in the in-files directory
+  and example-files contains example files
+
+
+-------------------------------------
+C-assess  version 0.7.1 (Dec 21, 2013)
+-------------------------------------
+- remove -Wpedantic from C++ assessments for the tool type gcc-warn as
+  it produces errors on some platforms due to differing exception
+  specification in different header files.  It should just produce a
+  warning, but instead produces an error and exits with a non-zero exit
+  code.
+
+-------------------------------------
+C-assess  version 0.7.0 (Dec 20, 2013)
+-------------------------------------
+- Full support for gcc warnings tool.  Tool-type is 'gcc-warn'.
+- renamed build.std{out,err} to build_std{out,err}.out
+- added configure_std{out,err}.out files to capture configuration output
+  instead of including it in run.out
+- if restarting an already run VM (/mnt/out/run.out exists), just exit run.sh
+  to allow debugging
+- eliminate duplicate FAIL messages in status.out,
+- eliminate 'FAIL: misc (...)' entries in status.out, if they are a cascaded
+  FAILs (they are only meant to capture miscellaneous failures not captured by
+  the main tasks
+- mark the 'all' task FAILed if anything FAILs
+
+-------------------------------------
+C-assess  version 0.6.0 (Dec 09, 2013)
+-------------------------------------
+- Full support for Clang Static Analyzer tool.  Tool-type is 'clang-sa'.
+
+-------------------------------------
+C-assess  version 0.5.5 (Dec 06, 2013)
+-------------------------------------
+- bug fix for build without assess
+
+-------------------------------------
+C-assess  version 0.5.4 (Dec 05, 2013)
+-------------------------------------
+- create status.out file in output directory (see status.out above)
+- fixed bug for packages that use libtool
+- fixed bug to skip source files and directories that do not exist after
+  the build (configure & test source files)
+- after creating the user account in run.sh, create a symbolic link from
+  /opt/swamp-base to the new home directory, allowing username independent
+  paths (for tools)
+- make archive of build and results in the case of failures for debugging
+
+-------------------------------------
+C-assess  version 0.5.3 (Nov 22, 2013)
+-------------------------------------
+- add xml declaration to created xml files
+- change assessment-summary.xml to assesment_summary.xml
+- change tag assessment-artifact to assessment-artifacts
+- when applying cppcheck disable information warnings
+- add package-root-dir and build-root-dir to build_summary.xml and
+  assessment_summary.xml
+- add assessment-summary-uuid, tool-type and tool-version to
+  assessment_summary.xml
+- add option to buildbug:  --packagerootdir
+
+-------------------------------------
+C-assess  version 0.5.2 (Nov 18, 2013)
+-------------------------------------
+- add build command attributes to build_summary.xml
+- fixed bug for builds that did multiple execs without forks
+
+-------------------------------------
+C-assess  version 0.5.1 (Nov 14, 2013)
+-------------------------------------
+- write assessment-summary.xml.
+- pass preexisting defines to cppcheck.
+- add support for 'tool-opt = systemincludedirs' takes much longer (25x), but
+  removes warning about missing include files.
+
+-------------------------------------
+C-assess  version 0.5 (Nov 12, 2013)
+-------------------------------------
+- initial release

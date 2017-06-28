@@ -1,0 +1,5513 @@
+#!/usr/bin/perl -w
+
+#
+#  buildbug   http://www.cs.wisc.edu/~kupsch
+# 
+#  Copyright 2013-2017 James A. Kupsch
+# 
+#  Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+# 
+#      http://www.apache.org/licenses/LICENSE-2.0
+# 
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+# 
+
+
+use strict;
+use Getopt::Long;
+use Config;
+use Cwd;
+use Time::HiRes qw( gettimeofday );
+use Data::Dumper;
+
+my $buildBugVersion = '1.1.7 (Apr 10, 2017)';
+my %options;
+my $statusFile;
+
+
+sub PrintUsage
+{
+    my $progname = $0;
+    $progname =~ s/.*[\\\/]//;
+    my $stdoutFile = defined $options{stdout} ? "($options{stdout})": '';
+    my $stderrFile = defined $options{stderr} ? "($options{stderr})": '';
+    my $statusFile = defined $options{status} ? "($options{status})": '';
+    print STDERR <<EOF;
+Usage: $progname [options]
+
+options:
+    --help          -h  print this message
+    --version           print version
+    --nobuild           use existing strace file
+    --strace            name of strace file         ($options{strace})
+    --stdout            name of command stdout file $stdoutFile
+    --stderr            name of command stderr file $stderrFile
+    --status            name of status file         $statusFile
+    --buildsummary      name of build_summary file  ($options{buildsummary})
+    --debuginfo         debug output                ($options{debuginfo})
+    --stracebin         path to strace command      ($options{stracebin})
+    --packagerootdir    path of directory containing package
+    --buildrootdir      path to build root
+    --resultsdir        path of directory for results
+    --package-name      name of package
+    --package-version   version of package
+    --plat-name         name of platform
+    --plat-uuid         uuid of platform
+    --tooltype          type of tool
+    --toolpath          path to tool
+    --toolopt           options for the tool
+    --toolconf          tool configuration file
+    --tooldir           tool directory
+    --toolsbasedir      tools base directory
+    --servicesconf      configuration for external services
+EOF
+}
+
+
+sub PrintVersion
+{
+    my $progname = $0;
+    $progname =~ s/.*[\\\/]//;
+    print "$progname version $buildBugVersion\n";
+}
+
+
+sub ProcessOptions
+{
+    %options = (
+		help		=> 0,
+		version		=> 0,
+		nobuild		=> 0,
+		strace		=> 'strace.out',
+		stdout		=> undef,
+		stderr		=> undef,
+		status		=> undef,
+		buildsummary	=> 'build_summary.xml',
+		debuginfo	=> '',
+		stracebin	=> 'strace',
+		packagerootdir	=> undef,
+		buildrootdir	=> undef,
+		resultsdir	=> undef,
+		'plat-name'	=> undef,
+		'plat-uuid'	=> undef,
+		'pkg-name'	=> undef,
+		'pkg-version'	=> undef,
+		tooltype	=> undef,
+		toolpath	=> undef,
+		toolopt		=> undef,
+		toolconf	=> undef,
+		tooldir		=> undef,
+		toolsbasedir	=> undef,
+		servicesconf	=> undef
+		);
+
+    my @options = (
+		"help|h!",
+		"version!",
+		"nobuild!",
+		"strace=s",
+		"stdout=s",
+		"stderr=s",
+		"status=s",
+		"buildsummary=s",
+		"debuginfo|results=s",
+		"stracebin=s",
+		"packagerootdir=s",
+		"buildrootdir=s",
+		"resultsdir=s",
+		"plat-name=s",
+		"plat-uuid=s",
+		"pkg-name=s",
+		"pkg-version=s",
+		"tooltype=s",
+		"toolpath=s",
+		"toolopt=s",
+		"toolconf=s",
+		"tooldir=s",
+		"toolsbasedir=s",
+		"servicesconf=s"
+		);
+    
+    Getopt::Long::Configure(qw/require_order no_ignore_case no_auto_abbrev/);
+    my $ok = GetOptions(\%options, @options);
+
+    if ($options{nobuild})  {
+	if ($#ARGV > 1)  {
+	    $ok = 0;
+	}  else  {
+	    $options{strace} = shift @ARGV if @ARGV;
+	}
+    }
+
+    if (!$ok || $options{help})  {
+	PrintUsage();
+	exit !$ok;
+    }
+
+    if ($options{version})  {
+	PrintVersion();
+	exit 0;
+    }
+
+    $statusFile = $options{status};
+}
+
+
+my %closingChar = (
+		'('	=> ')',
+		'['	=> ']',
+		'~['	=> ']',
+		'{'	=> '}',
+		'"'	=> '"',
+		);
+my %listType = (
+		'('	=> 'args',
+		'['	=> 'array',
+		'~['	=> 'comp-array',
+		'{'	=> 'struct',
+		);
+
+
+sub UnescapeCEscape
+{
+    my $s = shift;
+    my %m = (a => "\a", b => "\b", t => "\t", n => "\n", v => chr(11), f => "\f", r => "\r",
+	    '"' => '"', "'" => "'", "?" => "?", "\\" => "\\");
+    
+    if (exists $m{$s})  {
+	return $m{$s};
+    }  elsif ($s =~ /^[0-7]{1,3}$/)  {
+        my $v = oct($s) & 0xFF;
+        return chr($v);
+    }  elsif ($s =~ /^x([0-9a-fA-F]+)$/)  {
+        my $v = hex($s) & 0xFF;
+        return chr($v);
+    }  else  {
+        die "unknown C escape sequence $s";
+    }
+}
+
+
+sub UnescapeCString
+{
+    my $s = shift;
+
+    $s =~ s/\\([abtnrvf?\\"']|[0-7]{1,3}|x[0-9a-fA-F]+)/UnescapeCEscape($1)/ge;
+    return $s;
+}
+
+
+sub ParseExpr
+{
+    my ($s, $terminator) = @_;
+
+    my $i = 0;
+    my @q;
+    my $q;
+    my $c = '';
+    my $prevC;
+
+    while ($i + 1 < length($s))  {
+	$prevC = $c;
+	$c = substr($s, $i, 1);
+	last if !defined($q) && ($c eq ',' || $c eq $terminator);
+	if (defined $q && $q eq '"')  {
+	    next unless $c eq '"' && $prevC ne "\\";
+	}
+	if (defined($q) && $c eq $q)  {
+	    $q = pop @q;
+	}  elsif (exists $closingChar{$c})  {
+	    push @q, $q if defined $q;
+	    $q = $closingChar{$c};
+	}
+    }
+    continue  {
+	++$i;
+    }
+
+    die "unbalanced quote" if defined $q;
+
+    while ($i-- >= 0)  {
+	my $c = substr($s, $i, 1);
+	last if $c !~ /^\s$/;
+    }
+    
+    my $v = substr($s, 0, $i + 1, '');
+    return ($v, $s);
+}
+
+
+sub ParseArg
+{
+    my ($s, $terminator) = @_;
+    my $argName;
+    my $argType;
+    my $argValue;
+    my $termValue;
+    my $origText;
+
+    $s =~ s/^\s*//;
+    if ($s =~ s/^([a-zA-Z_][a-zA-Z0-9_]*)=//)  {
+	$argName = $1;
+    }
+
+    $s =~ s/^\s*//;
+    my $originalS = $s;
+    if ($s =~ /^(\(|\[|\~\[|\{)/)  {
+	my ($o, $s) = ParseList($s);
+	$o->{name} = $argName;
+	if ($s =~ s/^\s*([,\Q$terminator\E])//)  {
+	    return ($o, $s, $1);
+	}  else  {
+	    die "missing terminator in $originalS";
+	}
+    }
+
+    if ($s =~ s/^\s*"(.*?(?<!\\))"//)  {
+	$argValue = UnescapeCString($1);
+	if ($s =~ s/^\.{3}//)  {
+	    $argType = 'string-incomplete';
+	}  else  {
+	    $argType = 'string';
+	}
+    }  else  {
+	$argType = 'expr';
+	if ($s =~ s/^\s*([^,\Q$terminator\E({[]*?)\s*(?=[,\Q$terminator\E])//)  {
+	    $argValue = $1;
+	}  else  {
+	    ($argValue, $s) = ParseExpr($s, $terminator);
+	}
+    }
+
+    if ($originalS =~ /^(.*)\Q$s\E$/)  {
+	$origText = $1;
+	$origText =~ s/\s*$//;
+    }  else  {
+	die "remainder of string has been modified: originalS=$originalS    s=$s";
+    }
+
+    if ($s =~ s/^\s*([,\Q$terminator\E])//)  {
+	$termValue = $1;
+    }  else  {
+	die "missing terminator in $originalS";
+    }
+
+    my %o = (
+	    type	=> $argType,
+	    value	=> $argValue,
+	    name	=> $argName,
+	    origText	=> $origText,
+	    );
+
+    return (\%o, $s, $termValue);
+}
+
+
+sub ParseList
+{
+    my $s = shift;
+    my $originalS = $s;
+    my $listType;
+    my $listTerminator;
+    my @args;
+
+    if ($s =~ s/^\s*(\(|\[|\~\[|\{)\s*//)  {
+	$listType = $listType{$1};
+	$listTerminator = $closingChar{$1};
+    }  else  {
+	die "invalid list begin: $s";
+    }
+
+    if ($s !~ s/^\s*\Q$listTerminator\E//)  {
+	while (1)  {
+	    $s =~ s/^\s*//;
+	    if ($s eq '')  {
+		die "missing terminator '$listTerminator': $originalS";
+	    }
+
+	    my $o;
+	    my $termValue;
+	    ($o, $s, $termValue) = ParseArg($s, $listTerminator);
+	    push @args, $o;
+	    last if $termValue eq $listTerminator;
+	}
+    }
+
+    $originalS =~ /^(.*)\Q$s\E$/;
+    my %o = (
+	    type	=> $listType,
+	    value	=> \@args,
+	    name	=> undef,
+	    origText	=> $1,
+	    );
+
+    return (\%o, $s);
+}
+
+
+sub ParseStraceLineTidTsCmd
+{
+    my $line = shift;
+    if ($line =~ /^(\d+)\s+(\d+\.\d+)\s+(.*)$/)  {
+	my ($tid, $ts, $cmd) = ($1, $2, $3);
+	return ($tid, $ts, $cmd);
+    }  else  {
+	return;
+    }
+}
+
+
+sub ParseStraceLine
+{
+    my ($filename, $lineNum, $tid, $ts, $cmd) = @_;
+
+    my $cmdName;
+    my $cmdArgs;
+    my $cmdResult;
+    my $cmdResultMsg;
+    my $cmdErrno;
+    my $cmdErrMsg;
+    my $cmdDur;
+    my %o;
+
+    if ($cmd =~ s/\<(\d+(\.\d*))\>//)  {
+	$cmdDur = $1;
+    }
+    if ($cmd =~ /^\s*([a-zA-Z_][a-zA-Z0-9_]*)(\(.*)/)  {
+	my $cmdName = $1;
+	my $rest;
+	($cmdArgs, $rest) = ParseList($2);
+	if ($rest =~ /^\s*=\s*(\S+)\s*(.*)$/)  {
+	    $cmdResult = $1;
+	    if ($2 =~ /^(\S+)\s+\((.*)\)\s*$/)  {
+		$cmdErrno = $1;
+		$cmdErrMsg = $2;
+	    }  elsif ($2 =~ /^\((.*)\)$/)  {
+		$cmdResultMsg = $1;
+	    }  else  {
+		die "bad cmd (bad error format): $tid $ts $cmd" unless $2 =~ /^\s*$/;
+	    }
+	}  else  {
+	    die "bad cmd (no return value): $tid $ts $cmd + $rest";
+	}
+
+	%o = (
+		eventType	=> 'syscall',
+		cmdName		=> $cmdName,
+		cmdArgs		=> $cmdArgs,
+		cmdResult	=> $cmdResult,
+		cmdResultMsg	=> $cmdResultMsg,
+		cmdErrno	=> $cmdErrno,
+		cmdErrMsg	=> $cmdErrMsg
+	    );
+    }  elsif ($cmd =~ /^\s*---\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*(.*?)\s*---/)  {
+	%o = (
+		eventType	=> 'signal',
+		sigName		=> $1,
+		sigMsg		=> $2,
+	    );
+    }  elsif ($cmd =~ /^\s*\+\+\+\s+(.*?)\s*\+\+\+/)  {
+	my $msg = $1;
+	if ($msg =~ /^killed by\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*(.*?)/)  {
+	    %o = (
+		    eventType	=> 'killed',
+		    sigName	=> $1,
+		    sigMsg	=> $2
+		);
+	}  elsif ($msg =~ /^exited with\s+(\d*)/)  {
+	    %o = (
+		    eventType	=> 'exited',
+		    exitStatus	=> $1
+		);
+	}  else  {
+	    die "unknown +++ msg ('$msg'): $tid $ts $cmd";
+	}
+    }  else  {
+	die "bad cmd (no func call): $tid $ts $cmd";
+    }
+
+    $o{tid} = $tid;
+    $o{ts} = $ts;
+    $o{cmdDur} = $cmdDur;
+    $o{lineNum} = $lineNum;
+    $o{filename} = $filename;
+
+    return \%o;
+}
+
+
+my %findResumeImmediately = map { $_ => 1 } qw/fork vfork clone execve/;
+
+
+sub ProcessStrace
+{
+    my ($filename, $callback, $data) = @_;
+    my $lineNum = 0;
+    my @lines;
+    my %p;
+    my %unfinishedTracePrefixes;
+    
+    open STRACE, "<$filename" or die "open $filename: $!";
+    
+    while (1)  {
+	my $curLine;
+	if (@lines)  {
+	    $curLine = shift @lines;
+	}  else  {
+	    $curLine = <STRACE>;
+	    last unless defined $curLine;
+	    chomp $curLine;
+	}
+	++$lineNum;
+	next if $curLine eq '';
+
+	my ($tid, $ts, $cmd) = ParseStraceLineTidTsCmd($curLine);
+	if (defined $cmd)  {
+	    if ($cmd =~ /^\<\.\.\.\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+resumed\>(.*)$/)  {
+		my $k = "$tid---$1";
+		my $remainder = $2;
+		if (exists $unfinishedTracePrefixes{$k})  {
+		    my $prefix = $unfinishedTracePrefixes{$k};
+		    $curLine = "$tid $ts $prefix$remainder";
+		    $cmd = "$prefix$remainder";
+		    delete $unfinishedTracePrefixes{$k};
+		}  elsif ($1 eq 'futex' || $1 eq 'set_robust_list')  {
+		    # ignore, likely do to a clone event with locks held, and
+		    # released by the kernel due to thread scheduling
+		    next;
+		}  else  {
+		    die "Error: Invalid strace file, 'resumed' without prior 'unfinished' at $filename:$lineNum";
+		}
+	    }  elsif ($cmd =~ /^(([a-zA-Z_][a-zA-Z0-9_]*)\(.*)\s+\<unfinished \.\.\.\>$/)  {
+		my ($prefix, $func) = ($1, $2);
+		
+		if (exists $findResumeImmediately{$func})  {
+		    my $i = 0;
+		    while (1)  {
+			if (@lines <= $i)  {
+			    my $newLine = <STRACE>;
+			    if (!defined $newLine)  {
+				die "Incomplete strace file unfinished cmd '$curLine' in $filename:$lineNum";
+			    }
+			    chomp $newLine;
+			    push @lines, $newLine;
+			}
+
+			my $line = $lines[$i];
+			my ($newTid, $newTs, $newCmd) = ParseStraceLineTidTsCmd($line);
+			if (defined $newCmd)  {
+			    my $n = $lineNum + $i + 1;
+			    if ($newTid == $tid)  {
+				if ($newCmd =~ /^\<\.\.\.\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+resumed\>(.*)$/)  {
+				    if ($1 eq $func)  {
+					$curLine = "$tid $ts $prefix$2";
+					$cmd = "$prefix$2";
+					$lines[$i] = '';
+					last;
+				    }
+				}
+			    }
+			}
+			++$i;
+		    }
+		}  else  {
+		    my $k = "$tid---$func";
+		    die $k if exists $unfinishedTracePrefixes{$k};
+		    $unfinishedTracePrefixes{$k} = $prefix;
+		    redo;
+		}
+	    }
+
+	    my $o = ParseStraceLine($filename, $lineNum, $tid, $ts, $cmd);
+
+	    $callback->($o, $data);
+	}  else  {
+	    die "Bad line '$curLine' in $filename:$lineNum";
+	}
+    }
+
+    die join(' ', sort keys %unfinishedTracePrefixes) if (%unfinishedTracePrefixes);
+
+    close STRACE or die "close $filename: $!";
+}
+
+
+sub GetEnvArray
+{
+    my $env = shift;
+
+    return $env if ref($env) eq 'ARRAY';
+
+    my @a;
+    foreach my $k (keys %$env)  {
+	my $v = $env->{$k};
+	$v = '' unless defined $v;
+	push @a, "$k=$v";
+    }
+
+    return \@a;
+}
+
+
+sub GetEnvHashFromArray
+{
+    my $env = shift;
+    my %env;
+
+    return $env if ref($env) eq 'HASH';
+
+    foreach my $v (@$env)  {
+	my ($k, $v) = split /=/, $v, 2;
+	$v = '' unless defined $v;
+	$env{$k} = $v;
+    }
+
+    return \%env;
+}
+
+
+sub ExecCmd
+{
+    my ($args, $env, $execPath, $outFile, $errFile) = @_;
+
+    my $cmd;
+    if (ref($args) eq '')  {
+	$cmd = $args;
+    }  else  {
+	$execPath = $args->[0] unless defined $execPath;
+    }
+
+    my ($savedStdout, $savedStderr);
+    if (defined $outFile)  {
+	$outFile = '/dev/null' if $outFile eq '';
+	open $savedStdout, ">&", \*STDOUT or die "open savedStdout, >& STDOUT dup: $!";
+	open STDOUT, ">", $outFile or die "open STDOUT, >$outFile: $!\n";
+    }
+
+    if (defined $errFile)  {
+	$errFile = '/dev/null' if $errFile eq '';
+	open $savedStderr, ">&", \*STDERR or die "open savedStdErr, >& STDERR dup: $!";
+	open STDERR, ">", $errFile or die "open STDERR, >$errFile: $!\n";
+    }
+
+    my %savedEnv;
+    if (defined $env)  {
+	%savedEnv = %ENV;
+	$env = GetEnvHashFromArray($env);
+	%ENV = %$env;
+    }
+
+    if (defined $cmd)  {
+	system $cmd;
+    }  else  {
+	system {$execPath} @$args;
+    }
+    my $exitStatus = $?;
+    my $exitMsg = $!;
+
+    if (defined $env)  {
+	%ENV = %savedEnv;
+    }
+
+    if (defined $outFile)  {
+	close STDOUT or die "close STDOUT to restore stdout: $!";
+	open STDOUT, ">&", $savedStdout or die "open STDOUT, >& savedStdout dup restoring stdout: $!";
+    }
+
+    if (defined $errFile)  {
+	close STDERR or die "close STDERR to restore stderr: $!";
+	open STDERR, ">&", $savedStderr or die "open STDERR, >& savedStderr dup restoring stderr: $!";
+    }
+
+    my $exitCode;
+    my $exitSignal;
+    my $exitSignalName;
+    my $exitErrnoMsg;
+
+    if ($exitStatus == -1)  {
+	$exitErrnoMsg = $exitMsg;
+    }  elsif ($exitStatus & 127)  {
+	$exitSignal = $exitStatus & 127;
+	my $sig = (split ' ', $Config{sig_name})[$exitSignal];
+	$exitSignalName = "SIG$sig" if defined $sig;
+    }  else  {
+	$exitCode = $exitStatus >> 8;
+    }
+
+    return ($exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus);
+}
+
+
+sub ExecCmdAndFail
+{
+    my ($cmd) = @_;
+    my ($exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus) = ExecCmd(@_);
+
+    if ($exitStatus != 0)  {
+	my $s = GetExecErrorMsg($cmd, $exitCode, $exitSignal, $exitSignalName,
+				    $exitErrnoMsg, $exitStatus);
+	die $s;
+    }
+}
+
+
+my $bashNonMetaChars = qr/[a-zA-Z0-9.,_=+\/\@:-]/;
+
+sub HasBashMetaChars
+{
+    my $s = shift;
+    return ($s !~ /^$bashNonMetaChars*$/);
+}
+
+
+sub BashQuote
+{
+    my $s = shift;
+
+#   Simple and correct quoting, but verbose
+#
+#    return $s unless HasBashMetaChars($s);
+#    $s =~ s/'/'\\''/g;
+#    return "'$s'";
+
+    my @a = split /(')/, $s;
+    foreach (@a)  {
+	if (HasBashMetaChars($_))  {
+	    if ($_ eq "'")  {
+		$_ = "\\'";
+	    }  else  {
+		$_ = "'$_'";
+	    }
+	}
+    }
+    return join('', @a);
+}
+
+
+sub GetCmdString
+{
+    my $cmd = shift;
+    my $s;
+
+    if (ref($cmd) eq 'ARRAY')  {
+	$s = join ' ', map {BashQuote $_} @$cmd;
+    }  else  {
+	$s = $cmd;
+    }
+
+    return $s;
+}
+
+
+sub GetExecErrorMsg
+{
+    my ($cmd, $exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus) = @_;
+
+    my $s = GetCmdString($cmd) . " failed:";
+    $s .= " with exitCode=$exitCode" if defined $exitCode;
+    $s .= " with signal" if defined $exitSignal || defined $exitSignalName;
+    $s .= " $exitSignalName" if defined $exitSignalName;
+    $s .= " ($exitSignal)" if defined $exitSignal;
+    $s .= " exec error ($exitErrnoMsg)" if defined $exitErrnoMsg;
+
+    return $s;
+}
+
+
+sub StraceSysCallSupported
+{
+    my $sysCall = shift;
+    my @straceTest = ($options{stracebin}, '-e', $sysCall, '/bin/true');
+    my ($exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg)
+	    = ExecCmd(\@straceTest, undef, undef, '', '');
+    return defined $exitCode && $exitCode == 0;
+}
+
+
+sub BuildWithStrace
+{
+    my $traceSysCalls = "process,open,creat,close,dup,dup2,fcntl,fchdir,chdir";
+    for my $c (qw/dup3 openat fcntl64 unshare/)  {
+	$traceSysCalls .= ",$c" if StraceSysCallSupported($c);
+    }
+
+    my @straceVersionCmd = ($options{stracebin}, '-V');
+    print GetCmdString(\@straceVersionCmd), "\n-----\n";
+    ExecCmd(\@straceVersionCmd);
+    print "-----\n";
+
+    my @straceCmd = (
+		    $options{stracebin},
+		    "-f",
+		    "-v",
+		    "-ttt",
+		    "-s", "500000",
+		    "-e", $traceSysCalls,
+		    "-o", $options{strace},
+		    @_
+		    );
+
+    print GetCmdString(\@straceCmd), "\n-----\n";		#jk
+    ExecCmdAndFail(\@straceCmd, undef, undef, $options{stdout}, $options{stderr});
+}
+
+
+sub GetArgN
+{
+    my ($args, $position, $type) = @_;
+    my ($value, $incomplete);
+
+    die unless $args->{type} eq 'args';
+    die unless exists $args->{value}[$position];
+    my $v = $args->{value}[$position];
+
+    if ($type eq 'string')  {
+	die unless $v->{type} =~ /^string(-incomplete)?$/;
+	$value = $v->{value};
+	$incomplete = $v->{type} ne 'string';
+    }  elsif ($type eq 'int')  {
+	die unless $v->{type} eq 'expr';
+	$value = $v->{value};
+	$incomplete = 0;
+	die unless $value =~ /^\d+$/;
+    }  elsif ($type eq 'expr')  {
+	die unless $v->{type} eq 'expr';
+	$value = $v->{value};
+	$incomplete = 0;
+    }  elsif ($type eq 'array-string')  {
+	die unless $v->{type} eq 'array';
+	my $len = @{$v->{value}};
+	my @a;
+	for (my $i = 0; $i < $len; ++$i)  {
+	    my $j = $v->{value}[$i];
+	    if ($j->{type} =~ /^string(-incomplete)?$/)  {
+		$a[$i] = $j->{value};
+		$incomplete = 1 if $j->{type} eq 'string-incomplete';
+	    }  elsif ($j->{type} eq 'expr' && $i == ($len - 1) && $j->{value} =~ /^0x[0-9a-f]+$/i)  {
+		$incomplete += 2;
+	    }  else  {
+		die "Bad string arg: position=$position type=$type args=" . $args->{origText};
+	    }
+	}
+	$value = \@a;
+    }  elsif ($type eq 'array')  {
+	die unless $v->{type} eq 'array';
+	return $v->{value};
+    }  else  {
+	die;
+    }
+
+    if (!wantarray)  {
+	my ($pkg, $fn, $line) = caller;
+	die "GetArgN called in scalar context from $fn:$line";
+    }
+
+    return ($value, $incomplete);
+}
+
+
+sub GetArrayIndexOrigText
+{
+    my ($a, $i) = @_;
+    return $a->[$i]{origText};
+}
+
+
+sub GetExecveArgs
+{
+    my $cmd = shift;
+
+    my ($path, $args, $envs);
+    my ($incomplete, $argsIncomplete, $envsIncomplete);
+    die unless $cmd->{cmdName} eq 'execve';
+    my $cmdArgs = $cmd->{cmdArgs};
+    die unless @{$cmdArgs->{value}} eq 3;
+    ($path, $incomplete) = GetArgN($cmdArgs, 0, 'string');
+    die if $incomplete;
+    ($args, $argsIncomplete) = GetArgN($cmdArgs, 1, 'array-string');
+    ($envs, $envsIncomplete) = GetArgN($cmdArgs, 2, 'array-string');
+
+    return ($path, $args, $envs, $argsIncomplete, $envsIncomplete);
+}
+
+
+sub MakeAbsPath
+{
+    my ($curCwd, $path) = @_;
+
+    die "ERROR: MakeAbsPath('$curCwd', '$path') first path not absolute\n" unless $curCwd =~ /^\//;
+
+    if ($path !~ /^\//)  {
+	$path = "$curCwd/$path";
+    }
+
+    $path =~ s/\/\.\//\/\//g;
+    $path =~ s/\/\/+/\//g;
+    $path =~ s/\/\.?$//;
+    $path = '/' if $path eq '';
+
+    return $path;
+}
+
+
+sub ParseCloneFlags
+{
+    my ($flags) = @_;
+
+    my %h = map { $_ => 1 } split(/\|/, $flags);
+
+    return \%h;
+}
+
+
+sub DestroyThreads
+{
+    my ($procs, $p, $pid) = @_;
+
+    foreach my $i (keys %{$p->{threads}})  {
+	next if $i == $pid;
+	delete $procs->{$i};
+	delete $p->{threads}{$i};
+    }
+}
+
+
+sub ProcessSysCalls
+{
+    my ($cmd, $data) = @_;
+    my $type = $cmd->{eventType};
+    my $tid = $cmd->{tid};
+    my $ts = $cmd->{ts};
+
+    if (defined $cmd->{cmdName})  {
+	if (defined $cmd->{cmdErrno})  {
+	    ++$data->{callCount}{$cmd->{cmdName}}{fail};
+	}  else  {
+	    ++$data->{callCount}{$cmd->{cmdName}}{good};
+	}
+	if ($cmd->{cmdName} eq 'clone')  {
+	    $data->{cloneOpts}{$cmd->{cmdArgs}{value}[1]{value}}++;
+	}
+    }
+
+    my $procs = $data->{procs};
+    die "pid/tid ($tid) in strace ($cmd->{filename}:$cmd->{lineNum}), but not created from a fork/vfork/clone call"
+	    if $type ne 'exited' && %$procs && !exists $procs->{$tid};
+    if ($type eq 'syscall')  {
+	return if defined $cmd->{cmdErrno};
+	my $cmdName = $cmd->{cmdName};
+	if ($cmdName eq 'execve')  {
+	    if (!%$procs)  {
+		my $d = $data->{initialCwd};
+		$procs->{$tid} = {
+			    tid		=> $tid,
+			    pid		=> $tid,
+			    ppid	=> 0,
+			    curEid	=> $data->{numEids},
+			    startTs	=> $ts,
+			    curCwd	=> \$d,
+			    curOpenFds	=> {},
+			    execs	=> [],
+			    threads	=> { $tid => 1 }
+			    }
+	    }
+	    my $t = $procs->{$tid};
+	    my $pid = $t->{pid};
+	    my $p = ($pid != $tid) ? $t : $procs->{$pid};
+	    ${$p->{curCwd}} = ${$t->{curCwd}};
+	    $p->{curOpenFds} = $t->{curOpenFds};
+	    DestroyThreads($procs, $p, $pid);
+	    my $eid = ++$data->{numEids};
+	    my $peid = $p->{curEid};
+	    $data->{eids}{$peid}{stopTs} = $ts if exists $data->{eids}{$peid};
+	    $data->{rootEid} = $eid if $peid == '0';
+	    my ($path, $args, $envs, $argsIncomplete, $envsIncomplete) = GetExecveArgs($cmd);
+	    my $e = {
+		    pid		=> $pid,
+		    ppid	=> $p->{ppid},
+		    peid	=> $peid,
+		    eid		=> $eid,
+		    childEids	=> [],
+		    cmdPath	=> $path,
+		    startArgs	=> $args,
+		    startEnv	=> $envs,
+		    startCwd	=> ${$p->{curCwd}},
+		    startTs	=> $ts,
+		    stopTs	=> undef
+		    };
+	    $p->{curEid} = $eid;
+	    push @{$p->{execs}}, $e;
+	    push @{$data->{execs}}, $e;
+	    $data->{eids}{$eid} = $e;
+	    push @{$data->{eids}{$peid}{childEids}}, $eid if exists $data->{eids}{$peid};
+	    my $absPath = MakeAbsPath($e->{startCwd}, $path);
+	    ++$data->{cmdPaths}{$absPath};
+	    die "incomplete execve arg list seen at ts=$ts" if $argsIncomplete;
+	    print STDERR "WARNING: Incomplete ($envsIncomplete) execve env list seen at ts=$ts\n"
+		    if $envsIncomplete;	#jk
+	}  elsif ($cmdName eq 'vfork' || $cmdName eq 'clone' || $cmdName eq 'fork')  {
+	    my $newTid = $cmd->{cmdResult};
+	    die "pid ($newTid) returned from $cmdName, was previously created, but did not exit"
+		    if exists $procs->{$newTid};
+	    my $p = $procs->{$tid};
+	    my $cloneFlags = {};
+	    if ($cmdName eq 'clone')  {
+		my ($flags) = GetArgN($cmd->{cmdArgs}, 1, 'expr');
+		$cloneFlags = ParseCloneFlags($flags);
+	    }
+	    my $newP = $procs->{$newTid} = {
+			    tid		=> $newTid,
+			    curEid	=> $p->{curEid},
+			    startTs	=> $ts,
+			    execs	=> [],
+			    };
+	    if ($cloneFlags->{CLONE_THREAD})  {
+		$newP->{pid} = $p->{pid};
+		$newP->{ppid} = $p->{ppid};
+		$newP->{threads} = $p->{threads};
+	    }  else  {
+		$newP->{pid} = $newTid;
+		$newP->{ppid} = $tid;
+		$newP->{threads} = {};
+	    }
+	    $newP->{threads}{$newTid} = 1;
+	    if ($cloneFlags->{CLONE_FILES})  {
+		$newP->{curOpenFds} = $p->{curOpenFds};
+	    }  else  {
+		%{$newP->{curOpenFds}} = ( %{$p->{curOpenFds}} );
+	    }
+	    if ($cloneFlags->{CLONE_FS})  {
+		$newP->{curCwd} = $p->{curCwd};
+	    }  else  {
+		${$newP->{curCwd}} = ${$p->{curCwd}};
+	    }
+	}  elsif ($cmdName eq 'exit_group' || $cmdName eq '_exit')  {
+	    my ($exitStatus) = GetArgN($cmd->{cmdArgs}, 0, 'int');
+	    my $t = $procs->{$tid};
+	    my $pid = $t->{pid};
+	    my $p = ($pid != $tid) ? $t : $procs->{$pid};
+	    if ($cmdName eq 'exit_group')  {
+		DestroyThreads($procs, $p, $pid);
+		delete $p->{threads}{$pid};
+	    }  else  {
+		delete $p->{threads}{$tid};
+	    }
+	    if ((scalar keys %{$p->{threads}}) == 0)  {
+		my $e = $data->{eids}{$p->{curEid}};
+		$p->{exitStatus} = $exitStatus;
+		$e->{exitStatus} = $exitStatus;
+		$e->{stopTs} = $ts;
+		while (exists $data->{eids}{$e->{peid}})  {
+		    $e = $data->{eids}{$e->{peid}};
+		    last unless $tid eq $e->{pid};
+		    $e->{exitStatus} = $exitStatus;
+		}
+		delete $procs->{$pid};
+	    }
+	}  elsif ($cmdName eq 'unshare')  {
+	    my $p = $procs->{$tid};
+	    my ($flags) = GetArgN($cmd->{cmdArgs}, 0, 'expr');
+	    my $cloneFlags = ParseCloneFlags($flags);
+	    if ($cloneFlags->{CLONE_FS})  {
+		my $d = ${$p->{curCwd}};
+		$p->{curCwd} = \$d;
+	    }
+	    if ($cloneFlags->{CLONE_FILES})  {
+		my %fds = (%{$p->{curOpenFds}});
+		$p->{curOpenFds} = \%fds;
+	    }
+	}  elsif ($cmdName =~ /^(open|openat|creat)$/)  {
+	    my $p = $procs->{$tid};
+	    my ($pathPos, $relToPath);
+	    if ($cmdName eq 'openat')  {
+		$pathPos = 1;
+		my ($relFd) = GetArgN($cmd->{cmdArgs}, 0, 'expr');
+		if ($relFd eq 'AT_FDCWD')  {
+		    $relToPath = ${$p->{curCwd}};
+		}  elsif ($relFd =~ /^\d+$/)  {
+		    die "openat uses fd '$relFd' that is not open"
+			    unless defined $p->{openFds}{$relFd};
+		    $relToPath = $p->{openFds}{$relFd};
+		}  else  {
+		    die "openat: bad rel fd format '$relFd'";
+		}
+	    }  else  {
+		$pathPos = 0;
+		$relToPath = ${$p->{curCwd}};
+	    }
+	    my ($path, $incomplete) = GetArgN($cmd->{cmdArgs}, $pathPos, 'string');
+	    my $cmdResult = $cmd->{cmdResult};
+	    die "in open/create/openat path '$path' is incomplete" if $incomplete;
+	    $p->{openFds}{$cmdResult} = MakeAbsPath($relToPath, $path);
+	}  elsif ($cmdName eq 'close')  {
+	    my $p = $procs->{$tid};
+	    my ($fd) = GetArgN($cmd->{cmdArgs}, 0, 'int');
+	    delete $p->{openFds}{$fd};
+	}  elsif ($cmdName =~ /^dup[23]?$/)  {
+	    my $p = $procs->{$tid};
+	    my $cmdResult = $cmd->{cmdResult};
+	    my ($fd) = GetArgN($cmd->{cmdArgs}, 0, 'int');
+	    if (defined $p->{openFds}{$fd})  {
+		$p->{openFds}{$cmdResult} = $p->{openFds}{$fd};
+	    }
+	}  elsif ($cmdName =~ /^fcntl(64)?$/)  {
+	    my $p = $procs->{$tid};
+	    my $cmdResult = $cmd->{cmdResult};
+	    my ($fd) = GetArgN($cmd->{cmdArgs}, 0, 'int');
+	    my ($opts) = GetArgN($cmd->{cmdArgs}, 1, 'expr');
+	    if (defined $p->{openFds}{$fd} && $opts =~ /^F_DUPFD(_CLOEXEC)?$/)  {
+		$p->{openFds}{$cmdResult} = $p->{openFds}{$fd};
+	    }
+	}  elsif ($cmdName eq 'chdir')  {
+	    my $p = $procs->{$tid};
+	    my ($path, $incomplete) = GetArgN($cmd->{cmdArgs}, 0, 'string');
+	    die if $incomplete;
+	    ${$p->{curCwd}} = MakeAbsPath(${$p->{curCwd}}, $path);
+	}  elsif ($cmdName eq 'fchdir')  {
+	    my $p = $procs->{$tid};
+	    my ($fd) = GetArgN($cmd->{cmdArgs}, 0, 'int');
+	    die unless defined $p->{openFds}{$fd};
+	    ${$p->{curCwd}} = $p->{openFds}{$fd};
+	}  elsif ($cmdName =~ /^wait(4|pid)$/)  {
+	    my $waitedPid = $cmd->{cmdResult};
+	    if (($waitedPid != -1) && exists $procs->{$waitedPid})  {
+		# strace does not always include a 'killed' record, so check wait4 results also
+		# TODO: add waitid support also
+		my ($a) = GetArgN($cmd->{cmdArgs}, 1, 'array');
+		my $status = GetArrayIndexOrigText($a, 0);
+		if ($status =~ /WIFSIGNALED\(s\) && WTERMSIG\(s\) == (\w+)/)  {
+		    my $sigName = $1;
+		    my $sigMsg = '';
+		    my $p = $procs->{$waitedPid};
+		    DestroyThreads($procs, $p, $waitedPid);
+		    my $e = $data->{eids}{$p->{curEid}};
+		    $p->{exitSignal} = $sigName;
+		    $p->{exitSignalMsg} = $sigMsg;
+		    $e->{exitSignal} = $sigName;
+		    $e->{exitSignalMsg} = $sigMsg;
+		    $e->{stopTs} = $ts;
+		    while (exists $data->{eids}{$e->{peid}})  {
+			$e = $data->{eids}{$e->{peid}};
+			last unless $waitedPid eq $e->{pid};
+			$e->{exitSignal} = $sigName;
+			$e->{exitSignalMsg} = $sigMsg;
+		    }
+		    delete $procs->{$waitedPid};
+		}  elsif ($status =~ /WIFEXITED\(s\) && WEXITSTATUS\(s\) == (\d+)/)  {
+		    my $exitStatus = $1;
+		    my $p = $procs->{$waitedPid};
+		    DestroyThreads($procs, $p, $waitedPid);
+		    my $e = $data->{eids}{$p->{curEid}};
+		    $p->{exitStatus} = $exitStatus;
+		    $e->{exitStatus} = $exitStatus;
+		    $e->{stopTs} = $ts;
+		    while (exists $data->{eids}{$e->{peid}})  {
+			$e = $data->{eids}{$e->{peid}};
+			last unless $waitedPid eq $e->{pid};
+			$e->{exitStatus} = $exitStatus;
+		    }
+		    delete $procs->{$waitedPid};
+		}
+	    }
+	}
+    }  elsif ($type eq 'signal')  {
+	my $sigName = $cmd->{sigName};
+	my $sigMsg = $cmd->{sigMsg};
+	if ($sigName eq 'SIGTERM' && $sigMsg =~ /^\(Terminated\)/)  {
+	    my $p = $procs->{$tid};
+	    DestroyThreads($procs, $p, $tid);
+	    my $e = $data->{eids}{$p->{curEid}};
+	    $p->{exitSignal} = $sigName;
+	    $p->{exitSignalMsg} = $sigMsg;
+	    $e->{exitSignal} = $sigName;
+	    $e->{exitSignalMsg} = $sigMsg;
+	    $e->{stopTs} = $ts;
+	    while (exists $data->{eids}{$e->{peid}})  {
+		$e = $data->{eids}{$e->{peid}};
+		last unless $tid eq $e->{pid};
+		$e->{exitSignal} = $sigName;
+		$e->{exitSignalMsg} = $sigMsg;
+	    }
+	    delete $procs->{$tid};
+	}
+    }  elsif ($type eq 'killed')  {
+	my $p = $procs->{$tid};
+	DestroyThreads($procs, $p, $tid);
+	my $e = $data->{eids}{$p->{curEid}};
+	my $sigName = $cmd->{sigName};
+	my $sigMsg = $cmd->{sigMsg};
+	$p->{exitSignal} = $sigName;
+	$p->{exitSignalMsg} = $sigMsg;
+	$e->{exitSignal} = $sigName;
+	$e->{exitSignalMsg} = $sigMsg;
+	$e->{stopTs} = $ts;
+	while (exists $data->{eids}{$e->{peid}})  {
+	    $e = $data->{eids}{$e->{peid}};
+	    last unless $tid eq $e->{pid};
+	    $e->{exitSignal} = $sigName;
+	    $e->{exitSignalMsg} = $sigMsg;
+	}
+	delete $procs->{$tid};
+    }  elsif ($type eq 'exited')  {
+	# do nothing
+    }  else  {
+	die "Unknown strace type '$type'";
+    }
+}
+
+
+sub GetUuid
+{
+    my $s = `uuidgen`;
+    chomp $s;
+    return $s;
+}
+
+
+sub ReadFile
+{
+    my $filename = shift;
+
+    open F, $filename or die "open $filename: $!";
+    local $/;
+    my $s = <F>;
+    close F or die "close $filename: $!";
+
+    return $s;
+}
+
+
+sub WriteFile
+{
+    my ($filename, $s) = @_;
+
+    open F, ">", "$filename" or die "open >$filename: $!";
+    print F $s;
+    close F or die "close $filename: $!";
+}
+
+
+# Function to mimic buildargv from GNU libiberty.  Takes a string and breaks it
+# up into an argument list on whitespace and supports ', " and \.  Returns a
+# reference to an array of the arguments
+#
+sub GnuBuildArgv
+{
+    my $s = shift;
+    my @args;
+
+    my @a = ($s =~ /(['"\\]|\s+|[^'"\\\s]+)/g);
+    shift @a if @a && $a[0] =~ /^\s*$/;
+
+    my $a;
+    my $inQuote;
+    my $inBSlash;
+    foreach my $p (@a)  {
+	next if $p eq '';
+	if ($inBSlash)  {
+	    $inBSlash = 0;
+	    $a .= substr($p, 0, 1, '');
+	    redo;
+	}
+	if ($p eq "\\")  {
+	    $inBSlash = 1;
+	}  elsif (defined $inQuote)  {
+	    if ($inQuote eq $p)  {
+		undef $inQuote;
+	    }  else  {
+		$a .= $p;
+	    }
+	}  elsif ($p eq '"' || $p eq "'")  {
+	    $a .= '';
+	    $inQuote = $p;
+	}  elsif ($p =~ /^\s+$/)  {
+	    push @args, $a;
+	    undef $a;
+	}  else  {
+	    $a .= $p;
+	}
+    }
+
+    push @args, $a if defined $a;
+
+    return \@args;
+}
+
+
+sub GnuBuildArgvFromFile
+{
+    my $filename = shift;
+
+    local $/;
+    open INFILE, "<", $filename or return undef;
+    my $s = <INFILE>;
+    close INFILE or die "close $filename: $!";
+
+    return GnuBuildArgv($s);
+}
+
+
+# Function to mimic expandargv from GNU libiberty.  Takes an argument list
+# and replaces @file with the file's contents processed by GnuBuildArg if
+# the file can be opened.
+#
+sub GnuExpandArgv
+{
+    my $argv = shift;
+
+    my $maxFiles = 2000;	# same as libiberty
+    my $count = 0;
+    my $pos = 0;
+
+    while ($pos < @$argv)  {
+	if ($argv->[$pos] =~ /^@(.+)$/)  {
+	    die "GnuExpandArgv >$maxFiles @ files processed" if (++$count > $maxFiles);
+	    my $a = GnuBuildArgvFromFile($1);
+	    if (defined $a)  {
+		splice @$argv, $pos, 1, GnuBuildArgvFromFile($1);
+		next;
+	    }
+	}
+	++$pos;
+    }
+
+    return $argv;
+}
+
+
+# Function to mimic behavior of GNU's implementation of getopt, getopt_long,
+# and getopt_long_only.  Returns the name of the option, the value of its
+# argument, an error code and new status. Unique abbreviation of options are
+# allowed and optName is the unabbreviated name. The meaning of optName and
+# optValue being defined or not is:
+#
+#   optName  optValue  meaning
+#   -------  --------  -------
+#   defined  *         option found, if optValue defined it is the argument
+#   undef    defined   an non-option argument
+#   undef    undef     end of arguments
+#   empty    *         -- seen
+#
+# If error is defined, optName and optValue are set appropriately.  Valid
+# errors are:
+#
+#   invalidOptName	- option name is not valid
+#   ambiguousOptName	- abreviation is not unique
+#   missingArg		- argument required but not found
+#   noArgAllowed	- option has no argument but is of the form --opt=arg
+#
+# $shortOpts and $longOpts - hashes of valid options, value is argument type
+# 	r (required)
+# 	o (optional)
+# 	n (none)
+# $args - Arguments to process, processes all members of the array
+# $form - require '--' prefix for longOpts, or optionally allow just '-'
+# 	twolong      (require '--' prefix, like getopt_long)
+# 	oneortwolong (allow '-' or '--' prefix, like getopt_long_only)
+# argMode - how to handle encountering non-options
+#	end	(all remaining args are non-options)
+#	perm    (permute non-option args to the end)
+#	inline	(return non-options mixed with options)
+# state - hash (or undef initially) passed from call to call
+#
+sub GnuGetOpt
+{
+    my ($shortOpts, $longOpts, $args, $form, $argMode, $state) = @_;
+
+    $state = {} unless defined $state;
+    
+    my $aNum = $state->{aNum};
+    my $aPos = $state->{aPos};
+    my $optEnd = $state->{optEnd};
+    my $pArgs = $state->{pArgs};
+
+    $aNum = 0 unless defined $aNum;
+    $aPos = 0 unless defined $aPos;
+    $optEnd = 0 unless defined $optEnd;
+    $pArgs = [] unless defined $pArgs;
+    my $abbr = 1;
+
+    $shortOpts = {} unless defined $shortOpts;
+    $longOpts = {} unless defined $longOpts;
+
+    my ($optName, $optValue, $error);
+
+    while (1)  {
+	$optEnd = 1 unless exists $args->[$aNum];
+
+	# if permuted and at end of options, insert args here
+	if ($optEnd && @$pArgs)  {
+	    splice @$args, $aNum, 0, @$pArgs;
+	    @$pArgs = ();
+	}
+
+	# done if out of args
+	last unless exists $args->[$aNum];
+
+	# no options remain return all as args
+	my $a = $args->[$aNum];
+	if ($optEnd)  {
+	    $optValue = $a;
+	    ++$aNum;
+	    last;
+	}
+
+	# -- is end of options
+	if ($a eq '--')  {
+	    $optEnd = 1;
+	    ++$aNum;
+	    $optName = '';
+	    last;
+	}
+
+	my ($dashes, $v) = ($a =~ /^(-{0,2})(.*)/);
+
+	# non-options
+	if ($dashes eq '' || $a eq '-')  {
+	    if ($argMode eq 'end')  {
+		$optEnd = 1;
+		redo;
+	    }  elsif ($argMode eq 'perm')  {
+		push @$pArgs, $a;
+		splice @$args, $aNum, 1;
+		redo;
+	    }  elsif ($argMode eq 'inline')  {
+		$optValue = $a;
+		++$aNum;
+		last;
+	    }  else  {
+		die "unknown argMode $argMode";
+	    }
+	}
+
+	substr $v, 0, $aPos, '';
+	
+	if ($v eq '')  {
+	    ++$aNum;
+	    $aPos = 0;
+	    redo;
+	}
+
+	# long options
+	if ($dashes eq '--' || $form eq 'oneortwolong')  {
+	    my ($oN, $oV);
+	    if ($v =~ /^(.*?)=(.*)$/s)  {
+		($oN, $oV) = ($1, $2);
+	    }  else  {
+		$oN = $v;
+	    }
+
+	    my $oNLen = length $oN;
+	    my @opts;
+	    if (exists $longOpts->{$oN})  {
+		$opts[0] = $oN;
+	    }  elsif ($abbr)  {
+		@opts = grep {substr($_, 0, $oNLen) eq $oN} keys %$longOpts;
+	    }
+
+	    if (@opts == 1)  {
+		$optName = $opts[0];
+		++$aNum;
+		$aPos = 0;
+		my $argType = $longOpts->{$optName};
+		if ($argType eq 'n')  {
+		    $error = 'noArgAllowed' if defined $oV;
+		    last;
+		}  elsif ($argType eq 'o')  {
+		    $optValue = $oV;
+		    last;
+		}  elsif ($argType eq 'r')  {
+		    if (defined $oV)  {
+			$optValue = $oV;
+		    }  else  {
+			if (!exists $args->[$aNum])  {
+			    push @$args, @$pArgs;
+			    $optEnd = 1;
+			}
+			if (exists $args->[$aNum])  {
+			    $optValue = $args->[$aNum];
+			    ++$aNum;
+			}  else  {
+			    $error = 'missingArg';
+			}
+		    }
+		    last;
+		}  else  {
+		    die "unknown argType '$argType'";
+		}
+	    }  elsif (@opts == 0 && !exists $shortOpts->{substr($v,0,1)})  {
+		$optName = $oN;
+		$error = 'invalidOptName'
+	    }  elsif (@opts > 1 && !exists $shortOpts->{$v})  {
+		$optName = $oN;
+		$error = 'ambiguousOptName';
+	    }
+	}
+
+	# short options
+	if ($dashes eq '-' && !defined $optName)  {
+	    my ($oN, $oV) = ($v =~ /^(.)(.*)$/s);
+
+	    if (exists $shortOpts->{$oN})  {
+		undef $error;
+		$optName = $oN;
+		++$aPos;
+		my $argType = $shortOpts->{$optName};
+		if ($argType eq 'n')  {
+		    if ($oV eq '')  {
+			$aPos = 0;
+			++$aNum;
+		    }
+		}  elsif ($argType eq 'o')  {
+		    $aPos = 0;
+		    ++$aNum;
+		    if ($oV ne '')  {
+			$optValue = $oV;
+		    }
+		}  elsif ($argType eq 'r')  {
+		    $aPos = 0;
+		    ++$aNum;
+		    if ($oV ne '')  {
+			$optValue = $oV;
+		    }  else  {
+			if (!exists $args->[$aNum])  {
+			    push @$args, @$pArgs;
+			    $optEnd = 1;
+			}
+			if (exists $args->[$aNum])  {
+			    $optValue = $args->[$aNum];
+			    ++$aNum;
+			}  else  {
+			    $error = 'missingArg';
+			}
+		    }
+		}  else  {
+		    die "unknown argType '$argType'";
+		}
+		last;
+	    }  elsif ($form eq 'twolong')  {
+		$optName = $oN;
+		$error = 'invalidOptName';
+		++$aPos;
+		last;
+	    }
+	}
+
+	# report error from long opts
+	++$aNum;
+	$aPos = 0;
+	last;
+    }
+
+    my $newState = {aNum => $aNum, aPos => $aPos, optEnd => $optEnd, pArgs => $pArgs};
+
+    return ($optName, $optValue, $error, $newState);
+}
+
+
+sub NormalizeOpt
+{
+    my ($optName, $optMap) = @_;
+
+    return $optName unless defined $optName;
+    return $optMap->{$optName} if exists $optMap->{$optName};
+    return $optName;
+}
+
+
+sub BuildExecType
+{
+    # Old behavior:  only look for execs at well defined locations:
+    #
+    # ar:  /bin/ar /usr/bin/ar
+    # as:  /bin/as /usr/bin/as
+    # ld:  /bin/ld /usr/bin/ld
+    # gcc: /bin/cc  /bin/gcc /usr/bin/cc  /usr/bin/gcc /usr/bin/*-gcc
+    #      /usr/lib64/ccache/cc /usr/lib64/ccache/gcc
+    # g++: /bin/c++ /bin/g++ /usr/bin/c++ /usr/bin/g++ /usr/bin/*-g++
+    #      /usr/lib64/ccache/c++ /usr/lib64/ccache/g++
+    #
+    # New Behavior:  only use exec name, containing directory is ignored
+
+    my $origPath = shift;
+    my $path = $origPath;
+
+    #$path =~ s/^((\/usr)?\/bin\/|\/usr\/lib.*\/ccache\/)//;
+    $path =~ s/^(.*\/)//;
+    my $dir = $1;
+
+    # check if /<dir>/<os-name>-<COMPILER> is the same as <dir>/<COMPILER>
+    if ($path !~ /\// && $path =~ /^(.*)-(.*)$/)  {
+	if (my ($dev, $ino) = stat "$dir/$2")  {
+	    if (my ($origDev, $origIno) = stat "$origPath")  {
+		if ($dev == $origDev && $ino == $origIno)  {
+		    $path = $2;
+		}
+	    }
+	}
+    }
+    
+    my $type = '';
+    if ($path =~ /^g?cc$/)  {
+	$type = 'gcc'
+    }  elsif ($path =~ /^[gc]?\+\+$/)  {
+	$type = 'g++'
+    }  elsif ($path =~ /^(ld|ar|as)$/)  {
+	$type = $1
+    }
+
+    return $type;
+}
+
+
+my %gccExtToType = (
+	c	=> 'c',
+	cc	=> 'c++',
+	cp	=> 'c++',
+	cxx	=> 'c++',
+	C	=> 'c++',
+	cpp	=> 'c++',
+	CPP	=> 'c++',
+	'c++'	=> 'c++',
+	h	=> 'c-header',
+	i	=> 'cpp-output',
+	hh	=> 'c++-header',
+	H	=> 'c++-header',
+	hp	=> 'c++-header',
+	hxx	=> 'c++-header',
+	hpp	=> 'c++-header',
+	HPP	=> 'c++-header',
+	'h++'	=> 'c++-header',
+	tcc	=> 'c++-header',
+	ii	=> 'c++-cpp-output',
+	m	=> 'objective-c',
+	mi	=> 'objective-c-cpp-output',
+	mm	=> 'objective-c++',
+	M	=> 'objective-c++',
+	mii	=> 'objective-c++-cpp-output',
+	s	=> 'assembler',
+	S	=> 'assembler-with-cpp',
+	sx	=> 'assembler-with-cpp',
+	ada	=> 'ada',
+	adb	=> 'ada',
+	f	=> 'f77',
+	'for'	=> 'f77',
+	ftn	=> 'f77',
+	F	=> 'f77-cpp-input',
+	FOR	=> 'f77-cpp-input',
+	fpp	=> 'f77-cpp-input',
+	FPP	=> 'f77-cpp-input',
+	FTN	=> 'f77-cpp-input',
+	f90	=> 'f95',
+	f95	=> 'f95',
+	f03	=> 'f95',
+	f08	=> 'f95',
+	F90	=> 'f95-cpp-input',
+	F95	=> 'f95-cpp-input',
+	F03	=> 'f95-cpp-input',
+	F08	=> 'f95-cpp-input',
+	go	=> 'go',
+	java	=> 'java',
+    );
+    #		=> 'objective-c-header',
+    #		=> 'objective-c++-header',
+
+my %gccNonSrcExtToType = (
+	o	=> 'obj',
+	a	=> 'lib',
+	so	=> 'so'
+    );
+
+
+sub GetGccFileType
+{
+    my ($path, $type) = @_;
+
+    my $ext;
+    $ext = $1 if $path =~ /.*\.(.*?)$/;
+
+    if (defined $ext && exists $gccNonSrcExtToType{$ext})  {
+	$type = $gccNonSrcExtToType{$ext};
+    }  elsif ($type eq 'none')  {
+	if (defined $ext && exists $gccExtToType{$ext})  {
+	    $type = $gccExtToType{$ext};
+	}  else  {
+	    $type = 'other';
+	}
+    }
+
+    return $type;
+}
+
+
+sub ParseGccArgv
+{
+    my ($e) = @_;
+    my $buildExecType = BuildExecType($e->{cmdPath});
+    my $args = $e->{startArgs};
+    die unless $buildExecType eq 'gcc' || $buildExecType eq 'g++';
+
+    my %r = (buildExecType => $buildExecType, files => [], defines => [],
+	    include => [], includeSearch => [], libSearch => [], dialect => []);
+    my $curLang = 'none';
+    my @wpDefines;	# defines hidden in -Wp,-DX... or -Wp,-UX
+
+    my $argPos = 0;
+    while ($argPos < $#$args)  {
+	my ($optName, $optValue) = (undef, undef);
+	my $a = $args->[++$argPos];
+	if ($a eq '-')  {
+	    # - is an arg, do nothing
+	} elsif ($a =~ /^-([ADILTUleox]|MF|MT|MQ|idirafter|imacros|imultilib|include|iprefix|isysroot|iwithprefixbefore|iwithprefix)(.*)$/)  {
+	    ($optName, $optValue) = ($1, $2);
+	    $optValue=$2;
+	    $optValue = $args->[++$argPos] if $optValue eq '';
+	}  elsif ($a =~ /^--?(.*)$/s)  {
+	    $optName = $1;
+	    if ($optName =~ /^(.*?)=(.*)$/s)  {
+		($optName, $optValue) = ($1, $2);
+	    }
+	    if ($optName =~ /^(param|sysroot)$/ && !defined $optValue)  {
+		$optValue = shift @$args;
+	    }
+	}  elsif ($a =~ /^@(.*)/)  {
+	    die "Fatal ERROR, found $a as gcc argument, but not implemented";
+	}
+
+	if (defined $optName)  {
+	    if ($optName eq 'x')  {
+		$curLang = $optValue;
+	    }  elsif ($optName eq 'l')  {
+		my $lib = "-l$optValue";
+		push @{$r{files}}, $lib;
+		$r{fileTypes}{$lib} = 'l';
+	    }  elsif ($optName =~ /^[DU]$/)  {
+		push @{$r{defines}}, "-$optName$optValue";
+	    }  elsif ($optName =~ /^(help.*|fsyntax-only|M|MM|E|###|version)$/)  {
+		$r{op} = 'diagnostic';
+	    }  elsif ($optName eq 'c')  {
+		$r{op} = 'no-link' unless defined $r{op} && $r{op} eq 'diagnostic';
+	    }  elsif ($optName eq 'S')  {
+		$r{op} = 'no-asm' unless defined $r{op} && $r{op} eq 'diagnostic';
+	    }  elsif ($optName eq 'shared')  {
+		$r{op} = 'shared-lib' unless defined $r{op} && $r{op} eq 'diagnostic';
+		$r{shared} = 1;
+	    }  elsif ($optName eq 'o')  {
+		$r{o} = $optValue;
+	    }  elsif ($optName eq 'T')  {
+		$r{T} = $optValue;
+	    }  elsif ($optName eq 'include')  {
+		push @{$r{include}}, $optValue;
+	    }  elsif ($optName eq 'I')  {
+		push @{$r{includeSearch}}, $optValue;
+	    }  elsif ($optName eq 'L')  {
+		push @{$r{libSearch}}, $optValue;
+	    }  elsif ($a =~ /^-Wp,(-[DU].*)/)  {
+		push @wpDefines, $1;
+	    }  elsif ($optName =~ /^(std|ansi|pthread|trigraphs|traditional(-cpp)?|undef|Xpreprocessor|pedantic(-errors)?|imacros|idirafter|iwithprefix(before)?|isysroot|imultilib|isystem|iquote|A|sysroot|specs|no-sysroot-suffix|Wp,.*|f.*)$/)  {
+		push @{$r{dialect}}, $a;
+	    }
+	}  else  {
+	    push @{$r{files}}, $a;
+	    $r{fileTypes}{$a} = GetGccFileType($a, $curLang);
+	}
+    }
+    # defines and undefs from -Wp,-[DU] override regular -[DU]'s
+    push @{$r{defines}}, @wpDefines;
+
+    $r{op} = 'link' unless exists $r{op};
+    $r{outFile} = $r{o} if exists $r{o};
+    $r{outFile} = 'a.out' if $r{op} eq 'link' && !exists $r{outFile};
+
+    $e->{buildInfo} = \%r;
+
+    return \%r;
+}
+
+
+sub MakeBuildAction
+{
+    my ($e, $op, $inFiles, $outFile) = @_;
+    my %o = (
+	    eid		=> $e->{eid},
+	    op		=> $op,
+	    outFile	=> $outFile,
+	    inFiles	=> []
+	    );
+
+    my $files = $o{inFiles};
+    foreach my $f (@$inFiles)  {
+	push @$files, {path => $f, type => $e->{buildInfo}{fileTypes}{$f}};
+    }
+
+    return \%o;
+}
+
+
+sub SourceToObj
+{
+    my $f = shift;
+    $f =~ s/\.[^.]*?$/.o/s;
+    return $f;
+}
+
+
+sub GccBuildActions
+{
+    my $e = shift;
+
+    my @actions;
+    my $buildExecType = BuildExecType($e->{cmdPath});
+    die "Error: GccBuildAction called, but buildExecType not gcc/g++"
+	    unless $buildExecType eq 'gcc' || $buildExecType eq 'g++';
+
+    my $eid = $e->{eid};
+    my $bi = $e->{buildInfo};
+    my $op = $bi->{op};
+    my @files = grep {$bi->{fileTypes}{$_} =~ /^c(\+\+)?$/} @{$bi->{files}};
+    if ($op eq 'no-link')  {
+	if (@files == 0)  {
+	    # could be non-C/C++ files, ignore
+	    die "gcc -c with -o $bi->{outFile} but no source files" unless @{$bi->{files}} > 0;
+	}  else  {
+	    if (exists $bi->{outFile})  {
+		die "gcc -c with -o $bi->{outFile} requires exactly 1 source file, not: @{$bi->{files}}"
+			unless @files == 1;
+		push @actions, MakeBuildAction($e, 'compile', [$files[0]], $bi->{outFile});
+	    }  else  {
+		foreach my $f (@files)  {
+		    push @actions, MakeBuildAction($e, 'compile', [$f], SourceToObj($f));
+		}
+	    }
+	}
+    }  elsif ($op eq 'link' || $op eq 'shared-lib')  {
+	foreach my $f (@files)  {
+	    push @actions, MakeBuildAction($e, 'compile', [$f], SourceToObj($f));
+	}
+	push @actions, MakeBuildAction($e, $op, $bi->{files}, $bi->{outFile});
+    }  elsif ($op eq 'diagnostic')  {
+	# do nothing
+    }
+
+    return @actions;
+}
+
+
+my %ldShortOpts = qw/
+    a r    A r    b r    c r    d n    e r    E n    f r    F r    g n    G r    h r    I r
+    l r    L r    m r    M n    n n    N n    o r    O r    q n    r n    i n    R r    s n
+    S n    t n    T r    u r    v n    V n    x n    X n    y r    Y r    ( n    ) n
+/;
+
+my %ldLong1Opts = qw/
+    architecture                 r    format                       r
+    mri-script                   r    dc                           n
+    dp                           n    entry                        r
+    export-dynamic               n    no-export-dynamic            n
+    EB                           n    EL                           n
+    auxiliary                    r    filter                       r
+    gpsize                       r    soname                       r
+    dynamic-linker               r    library                      r
+    library-path                 r    sysroot                      r
+    print-map                    n    nmagic                       n
+    plugin                       r    plugin-opt                   r
+    flto                         o    flto-partition               r
+    Qy                           n    emit-relocs                  n
+    relocatable                  n    just-symbols                 r
+    strip-all                    n    strip-debug                  n
+    strip-discarded              n    no-strip-discarded           n
+    trace                        n    script                       r
+    default-script               r    dT                           r
+    undefined                    r    unique                       o
+    Ur                           n    version                      n
+    discard-all                  n    discard-locals               n
+    discard-none                 n    trace-symbol                 r
+    start-group                  n    end-group                    n
+    accept-unknown-input-arch    n    no-accept-unknown-input-arch n
+    add-needed                   n    no-add-needed                n
+    as-needed                    n    no-as-needed                 n
+    assert                       r    Bdynamic                     n
+    dy                           n    call_shared                  n
+    Bstatic                      n    dn                           n
+    non_shared                   n    static                       n
+    Bsymbolic                    n    Bsymbolic-functions          n
+    check-sections               n    no-check-sections            n
+    copy-dt-needed-entries       n    no-copy-dt-needed-entries    n
+    cref                         n    defsym                       r
+    demangle                     o    embedded-relocs              n
+    fatal-warnings               n    no-fatal-warnings            n
+    fini                         r    force-exe-suffix             n
+    gc-sections                  n    no-gc-sections               n
+    print-gc-sections            n    no-print-gc-sections         n
+    hash-size                    r    help                         n
+    init                         r    Map                          r
+    no-define-common             n    no-demangle                  n
+    no-keep-memory               n    no-undefined                 n
+    allow-shlib-undefined        n    no-allow-shlib-undefined     n
+    allow-multiple-definition    n    no-undefined-version         n
+    default-symver               n    default-imported-symver      n
+    no-warn-mismatch             n    no-warn-search-mismatch      n
+    no-whole-archive             n    noinhibit-exec               n
+    noinhibit_exec               n    nostdlib                     n
+    print-output-format          n    qmagic                       n
+    reduce-memory-overheads      n    relax                        n
+    no-relax                     n    retain-symbols-file          r
+    rpath                        r    rpath-link                   r
+    shared                       n    Bshareable                   n
+    pie                          n    pic-executable               n
+    sort-common                  o    sort_common                  n
+    sort-section                 r    spare-dynamic-tags           r
+    split-by-file                o    split-by-reloc               o
+    stats                        n    target-help                  n
+    task-link                    r    traditional-format           n
+    section-start                r    Tbss                         r
+    Tdata                        r    Ttext                        r
+    Ttext-segment                r    Trodata-segment              r
+    unresolved-symbols           r    verbose                      o
+    dll-verbose                  n    version-script               r
+    version-exports-section      r    dynamic-list-data            n
+    dynamic-list-cpp-new         n    dynamic-list-cpp-typeinfo    n
+    dynamic-list                 r    warn-common                  n
+    warn-constructors            n    warn-multiple-gp             n
+    warn-once                    n    warn-section-align           n
+    warn-shared-textrel          n    warn-alternate-em            n
+    warn-unresolved-symbols      n    error-unresolved-symbols     n
+    whole-archive                n    wrap                         r
+/;
+
+my %ldLong2Opts = qw/
+    omagic    n    no-omagic n    output    r    oformat   r
+/;
+
+my %ldOptMap = qw/
+    A                         architecture      b                         format        
+    c                         mri-script        d                         dc            
+    dp                        dc                e                         entry         
+    E                         export-dynamic    f                         auxiliary     
+    F                         filter            G                         gpsize        
+    h                         soname            I                         dynamic-linker
+    l                         library           L                         library-path  
+    M                         print-map         n                         nmagic        
+    N                         omagic            o                         output        
+    flto-partition            flto              Qy                        flto          
+    q                         emit-relocs       r                         relocatable   
+    R                         just-symbols      s                         strip-all     
+    S                         strip-debug       t                         trace         
+    T                         script            dT                        default-script
+    u                         undefined         v                         version       
+    x                         discard-all       X                         discard-locals
+    y                         trace-symbol      (                         start-group   
+    )                         end-group         dy                        Bdynamic      
+    call_shared               Bdynamic          dn                        Bstatic       
+    non_shared                Bstatic           static                    Bstatic       
+    copy-dt-needed-entries    add-needed        no-copy-dt-needed-entries no-add-needed 
+    noinhibit_exec            noinhibit-exec    qmagic                    flto          
+    pic-executable            pie               sort_common               sort-common   
+    dll-verbose               verbose       
+/;
+
+
+sub GnuLdOptFunc
+{
+    my ($data, $optName, $optNormName, $optValue, $error, $state) = @_;
+
+    if (defined $error)  {
+	print " ERROR: $error $optName\n";
+    }  elsif (exists $data->{''})  {
+	# ld ignores args after --
+    }  elsif (defined $optNormName)  {
+	if ($optNormName eq 'library')  {
+	    push @{$data->{l}}, "-l$optValue";
+	}  else  {
+	    $data->{$optNormName} = $optValue
+	}
+    }  else  {
+	push @{$data->{'l'}}, $optValue if defined $optValue;
+    }
+}
+
+
+sub ProcessGnuLdOpts
+{
+    my ($argv) = @_;
+
+    my @errors;
+    my $data = {};
+    my $state = {};
+    my $newState;
+
+    my $args = GnuExpandArgv($argv);
+    map {s/^-l(.+)/--library=$1/; s/^-G\d.*/-G/} @$args;
+
+    while (1)  {
+	my ($optName, $optValue, $error, $newState)
+		= GnuGetOpt(\%ldShortOpts, \%ldLong1Opts, $args, 'oneortwolong', 'inline', $state);
+	if (defined $error && $error eq 'invalidOptName')  {
+	    ($optName, $optValue, $error, $newState)
+		    = GnuGetOpt(undef, \%ldLong2Opts, $args, 'twolong', 'inline', $state);
+	}
+	last unless defined $optName || defined $optValue;
+	my $optNormName = NormalizeOpt($optName, \%ldOptMap);
+	$state = $newState;
+	GnuLdOptFunc $data, $optName, $optNormName, $optValue, $error, $state;
+    }
+
+    return $data;
+}
+
+
+sub ParseBuildCommandArgv
+{
+    my ($data, $e) = @_;
+    my $type = BuildExecType($e->{cmdPath});
+
+    if ($type eq 'gcc' || $type eq 'g++')  {
+	ParseGccArgv($e);
+	push @{$data->{buildActions}}, GccBuildActions($e);
+    #}  elsif ($type eq 'ld')  {
+    #}  elsif ($type eq 'ar')  {
+    #}  elsif ($type eq 'as')  {
+    }  else  {
+	my %r = (buildExecType => $type, files => [], defines => [],
+		include => [], includeSearch => [], libSearch => [],
+		dialect => []);
+	$e->{buildInfo} = \%r;
+    }
+}
+
+
+sub GetGccInfo
+{
+    my $path = shift;
+    my %o = (target => '', version => '');
+
+    for my $lang (qw( c c++ ))  {
+	my $cmd = "$path -v -dM -E -x$lang /dev/null 2>&1";
+	my $searchPathType = '';
+	$o{includeSearch}{$lang} = [];
+	$o{systemIncludeSearch}{$lang} = [];
+	$o{defines}{$lang} = [];
+	$o{bits} = 32;
+
+	open GCC, "$cmd|" or die "open $cmd: $!";
+	while (<GCC>)  {
+	    if (/^Target:\s+(.*?)\s*$/)  {
+		$o{target} = $1;
+	    }  elsif (/^gcc version\s+(.*?)\s*$/)  {
+		$o{version} = $1;
+	    }  elsif (/^#include "..." search starts here:/)  {
+		$searchPathType = 'includeSearch';
+	    }  elsif (/^#include <...> search starts here:/)  {
+		$searchPathType = 'systemIncludeSearch';
+	    }  elsif (/^End of search list./)  {
+		$searchPathType = '';
+	    }  elsif ($searchPathType ne '' && /^\s*(.*?)\s*$/)  {
+		push @{$o{$searchPathType}{$lang}}, $1;
+	    }  elsif (/^#define\s+(.*?)\s*$/)  {
+		my $dOpt;
+		if ($1 =~ /^([_a-zA-Z][_a-zA-Z0-9]*)\s*(.*?)\s*$/)  {
+		    $o{bits} = 64 if $1 eq '__x86_64__';
+		    $dOpt = "-D$1";
+		    # -Dvar defines var to be 1, all other values use -Dvar=value
+		    $dOpt .= "=$2" unless $2 eq '1';
+		}  else  {
+		    die "system macro with arguments not implemented: $_";
+		}
+		push @{$o{defines}{$lang}}, $dOpt;
+	    }
+	}
+	close GCC or die "close ($?) $cmd: $!";
+    }
+
+    return \%o;
+}
+
+
+sub GetFirstLineVersion
+{
+    my ($path, $versionOpt) = @_;
+
+    my $cmd = "$path $versionOpt";
+    my $version;
+    
+    open AR, "$cmd|" or die "open $cmd: $!";
+    while (<AR>)  {
+	if (!defined $version)  {
+	    chomp;
+	    $version = $_;
+	}
+    }
+    close AR or die "close ($?) $cmd: $!";
+
+    my %o = ( version => $version );
+
+    return \%o;
+}
+
+
+sub GetArInfo
+{
+    my $path = shift;
+
+    return GetFirstLineVersion($path, '-V');
+}
+
+
+sub GetLdInfo
+{
+    my $path = shift;
+
+    return GetFirstLineVersion($path, '-V');
+}
+
+
+sub GetAsInfo
+{
+    my $path = shift;
+
+    return GetFirstLineVersion($path, '--version');
+}
+
+
+sub GetGccCandidateWarnings
+{
+    my ($path, $lang) = @_;
+    my @warnings = qw(
+	    -Wlarger-than=1000000 -Wframe-larger-than=50000 -Wstack-usage=50000
+	    -Wformat=2 -Wnormalized=nfc
+	    );
+
+    my $cmd = "$path --help=warnings 2>&1";
+    open CMD, "$cmd|" or die "open $cmd|: $!";
+    while (<CMD>)  {
+	if (/^\s*(-W\S*)/)  {
+	    my $w = $1;
+	    next if $w =~ /=$/;
+	    next if $w =~ /^-Werror/;
+	    next if $w =~ /=\</;
+	    push @warnings, $w;
+	}
+    }
+    my $r = close CMD;
+
+    if (!$r || !@warnings)  {
+	push @warnings, qw(
+	    -W -Wabi -Wabi-tag -Waddress -Waggregate-return
+	    -Waggressive-loop-optimizations -Waliasing -Walign-commons -Wall
+	    -Wampersand -Warray-bounds -Warray-temporaries -Wassign-intercept
+	    -Wattributes -Wbad-function-cast -Wbuiltin-macro-redefined
+	    -Wc++-compat -Wc++0x-compat -Wc++11-compat -Wc-binding-type
+	    -Wcast-align -Wcast-qual -Wchar-subscripts -Wcharacter-truncation
+	    -Wclobbered -Wcomment -Wcomments -Wcompare-reals -Wconversion
+	    -Wconversion-extra -Wconversion-null -Wcoverage-mismatch -Wcpp
+	    -Wctor-dtor-privacy -Wdeclaration-after-statement
+	    -Wdelete-non-virtual-dtor -Wdeprecated -Wdeprecated-declarations
+	    -Wdisabled-optimization -Wdiv-by-zero -Wdouble-promotion -Weffc++
+	    -Wempty-body -Wendif-labels -Wenum-compare -Wextra -Wfloat-equal
+	    -Wformat -Wformat-contains-nul -Wformat-extra-args
+	    -Wformat-nonliteral -Wformat-security -Wformat-y2k
+	    -Wformat-zero-length -Wfree-nonheap-object -Wfunction-elimination
+	    -Wignored-qualifiers -Wimplicit -Wimplicit-function-declaration
+	    -Wimplicit-int -Wimplicit-interface -Wimplicit-procedure
+	    -Winherited-variadic-ctor -Winit-self -Winline -Wint-to-pointer-cast
+	    -Wintrinsic-shadow -Wintrinsics-std -Winvalid-memory-model
+	    -Winvalid-offsetof -Winvalid-pch -Wjump-misses-init -Wlarger-than-
+	    -Wline-truncation -Wliteral-suffix -Wlogical-op -Wlong-long -Wmain
+	    -Wmaybe-uninitialized -Wmissing-braces -Wmissing-declarations
+	    -Wmissing-field-initializers -Wmissing-include-dirs
+	    -Wmissing-parameter-type -Wmissing-prototypes -Wmudflap -Wmultichar
+	    -Wnarrowing -Wnested-externs -Wnoexcept -Wnon-template-friend
+	    -Wnon-virtual-dtor -Wnonnull -Wold-style-cast
+	    -Wold-style-declaration -Wold-style-definition -Woverflow
+	    -Woverlength-strings -Woverloaded-virtual -Woverride-init -Wpacked
+	    -Wpacked-bitfield-compat -Wpadded -Wparentheses -Wpedantic
+	    -Wpmf-conversions -Wpointer-arith -Wpointer-sign
+	    -Wpointer-to-int-cast -Wpragmas -Wproperty-assign-default -Wprotocol
+	    -Wreal-q-constant -Wrealloc-lhs -Wrealloc-lhs-all -Wredundant-decls
+	    -Wreorder -Wreturn-local-addr -Wreturn-type -Wselector
+	    -Wsequence-point -Wshadow -Wsign-compare -Wsign-promo
+	    -Wsizeof-pointer-memaccess -Wstack-protector -Wstrict-aliasing
+	    -Wstrict-null-sentinel -Wstrict-overflow -Wstrict-prototypes
+	    -Wstrict-selector-match -Wsuggest-attribute=const
+	    -Wsuggest-attribute=format -Wsuggest-attribute=noreturn
+	    -Wsuggest-attribute=pure -Wsurprising -Wswitch -Wswitch-default
+	    -Wswitch-enum -Wsync-nand -Wsynth -Wsystem-headers -Wtabs
+	    -Wtarget-lifetime -Wtraditional -Wtraditional-conversion
+	    -Wtrampolines -Wtrigraphs -Wtype-limits -Wundeclared-selector
+	    -Wundef -Wunderflow -Wuninitialized -Wunknown-pragmas
+	    -Wunsafe-loop-optimizations -Wunsuffixed-float-constants -Wunused
+	    -Wunused-but-set-parameter -Wunused-but-set-variable
+	    -Wunused-dummy-argument -Wunused-function -Wunused-label
+	    -Wunused-local-typedefs -Wunused-macros -Wunused-parameter
+	    -Wunused-result -Wunused-value -Wunused-variable -Wuseless-cast
+	    -Wvarargs -Wvariadic-macros -Wvector-operation-performance
+	    -Wvirtual-move-assign -Wvla -Wvolatile-register-var -Wwrite-strings
+	    -Wzero-as-null-pointer-constant
+	    );
+    }
+    
+    my @removeWarnings = qw(
+	    -Wtraditional -Wtraditional-conversion -Wtrampoline -Wc++-compat
+	    -Waggregate-return -Werror -Werror-implicit-function-declaration
+	    -Wpendantic -Wstrict-overflow= -Wstrict-overflow -Wsystem-headers
+	    -Wdisabled-optimizations -Wdouble-promotion -Wlong-long
+	    -Wpadded -Winline
+	    );
+    push @removeWarnings, '-Wpedantic' if $lang eq 'c++';
+    my %removeWarnings = map {$_ => 1} @removeWarnings;
+
+    @warnings = grep {!$removeWarnings{$_}} @warnings;
+
+    return \@warnings;
+}
+
+
+sub IsGccOptValid
+{
+    my ($path, $lang, $opt) = @_;
+
+    my $cmd = "$path $opt -x$lang -c /dev/null -o /dev/null 2>&1";
+    open CMD, "$cmd|" or die "open $cmd|: $!";
+    my $s = '';
+    while (my $line = <CMD>)  {
+	$s .= $line;
+    }
+    my $r = close CMD;
+
+    return $r && $s eq '';
+}
+
+
+sub GetGccValidWarnings
+{
+    my ($path, $lang, $tryWarnings, $disableWarnings) = @_; 
+
+    $tryWarnings = GetGccCandidateWarnings($path, $lang) unless defined $tryWarnings;
+
+    push @$tryWarnings, '-fdiagnostics-show-option';
+
+    my @validWarnings = grep {IsGccOptValid($path, $lang, $_)} @$tryWarnings;
+
+    unless (defined $disableWarnings)  {
+	$disableWarnings = {
+		    '-Wcomments'	=> '-Wcomment',
+		    '-Wc++0x-compat'	=> '-Wc++11-compat',
+		    '--all-warnings'	=> '-Wall',
+		    '--extra-warnings'	=> '-Wextra',
+		    '-W'		=> '-Wextra',
+		    '-Wformat'		=> '-Wformat=2',
+		    };
+
+    }
+
+    if (ref($disableWarnings) eq 'ARRAY')  {
+	my %w = map {$_ => 1} @$disableWarnings;
+	$disableWarnings = \%w;
+    }
+
+    my %validWarnings = map { $_ => 1 } @validWarnings;
+
+    foreach my $k (keys %$disableWarnings)  {
+	next unless exists $validWarnings{$k};
+	my $v = $disableWarnings->{$k};
+	next if $v && !exists $validWarnings{$v};
+	delete $validWarnings{$k};
+    }
+
+    @validWarnings = sort keys %validWarnings;
+
+    return \@validWarnings;
+}
+
+
+sub GetCmdInfo
+{
+    my $data = shift;
+
+    foreach my $path (keys %{$data->{cmdPaths}})  {
+	next if defined $data->{cmdInfo}{$path};
+	my $type = BuildExecType($path);
+	next if $type eq '';
+
+	if ($type eq 'gcc' || $type eq 'g++')  {
+	    $data->{cmdInfo}{$path} = GetGccInfo($path);
+	}  elsif ($type eq 'ar')  {
+	    $data->{cmdInfo}{$path} = GetArInfo($path);
+	}  elsif ($type eq 'ld')  {
+	    $data->{cmdInfo}{$path} = GetLdInfo($path);
+	}  elsif ($type eq 'as')  {
+	    $data->{cmdInfo}{$path} = GetAsInfo($path);
+	}
+    }
+}
+
+
+sub GetBuildCommandOpts
+{
+    my ($data, $ba) = @_;
+    my %o;
+    if ($ba->{op} eq 'compile')  {
+	my $lang = $ba->{inFiles}[0]{type};
+	my $e = $data->{eids}{$ba->{eid}};
+	my $cmdPath = $e->{cmdPath};
+	if (exists $data->{cmdInfo}{$cmdPath})  {
+	    my $ci = $data->{cmdInfo}{$cmdPath};
+	    $o{version} = $ci->{version};
+	    $o{target} = $ci->{target};
+	    $o{defines} = $ci->{defines}{$lang};
+	    $o{systemIncludeSearch} = $ci->{systemIncludeSearch}{$lang};
+	    $o{includeSearch} = $ci->{includeSearch}{$lang};
+	}
+    }
+
+    return \%o;
+}
+
+
+sub FindAllBuildCommands
+{
+    my ($data, $eid) = @_;
+    my $e = $data->{eids}{$eid};
+    my $exitStatus = $e->{exitStatus};
+    my $cmd = $e->{cmdPath};
+    if (defined $exitStatus && $exitStatus == 0 && BuildExecType($cmd))  {
+	push @{$data->{buildEids}}, $eid;
+	ParseBuildCommandArgv($data, $e);
+	return;
+    }
+    foreach my $child (@{$e->{childEids}})  {
+	FindAllBuildCommands($data, $child);
+    }
+}
+
+
+sub SplitTs
+{
+    my $ts = shift;
+    my ($s, $m);
+
+    if ($ts =~ /^(\d+)\.(\d*)$/)  {
+	$s = 0 + $1;
+	$m = 0 + substr("${2}000000", 0, 6);
+    }  elsif ($ts =~ /^(\d+)$/)  {
+	$s = 0 + $1;
+	$m = 0;
+    }  else  {
+	die "Invalid timestamp ($ts)";
+    }
+
+    return ($s, $m);
+}
+
+
+sub JoinTs
+{
+    my ($s, $m) = @_;
+
+    return sprintf "%d.%06d", $s, $m;
+}
+
+
+sub MakeTs
+{
+    my $t = shift;
+
+    return JoinTs SplitTs $t;
+}
+
+
+sub GetCurTs
+{
+    return JoinTs gettimeofday();
+}
+
+
+sub DiffTs
+{
+    my ($startTs, $stopTs) = @_;
+
+    my ($startS, $startMicroS) = SplitTs($startTs);
+    my ($stopS, $stopMicroS) = SplitTs($stopTs);
+
+    my ($s, $m) = ($stopS - $startS, $stopMicroS - $startMicroS);
+
+    if ($m < 0)  {
+	--$s;
+	$m += 1000000;
+    }
+
+    return JoinTs($s, $m);
+}
+
+
+my $logged = 'logged: ';
+sub ShouldStatusLog
+{
+    my $s = shift;
+    return defined $s && $s ne '' && $s !~ /^$logged/;
+}
+
+
+sub RestoreStatusLogMsg
+{
+    my $msg = shift;
+    $msg =~ s/^$logged//;
+    return $msg;
+}
+
+
+sub LogStatus
+{
+    my ($task, $shortMsg, $state, $dur, $msg) = @_;
+
+    return $msg unless defined $statusFile;
+
+    my $div = "----------\n";
+    my $prefix = '  ';
+    $state = 0 unless $state;
+    my %stateToMsg = (0 => 'PASS', 1 => 'FAIL', -1 => 'SKIP', -2 => 'NOTE');
+    die "LogStatus: unknown state ($state)" unless defined $stateToMsg{$state};
+    my $stateMsg = $stateToMsg{$state};
+    $dur = '' unless defined $dur;
+    $dur = MakeTs($dur) . 's' unless $dur eq '';
+    $task .= " ($shortMsg)" if defined $shortMsg && $shortMsg ne '';
+
+    my $newMsg = $msg;
+
+    my $s = sprintf "%s: %-59s %14s\n", $stateMsg, $task, $dur;
+    if (ShouldStatusLog($msg))  {
+	$newMsg = "${logged}$msg";
+	$msg .= "\n" unless substr($msg, -1, 1) eq "\n";
+	$msg =~ s/^/$prefix/gm;
+	$s .= "$prefix$div$msg$prefix$div";
+    }
+
+    open STATUSFILE, ">>", $statusFile or die "open $statusFile: $!";
+    printf STATUSFILE $s;
+    close STATUSFILE or die "close $statusFile: $!";
+
+    return $newMsg;
+}
+
+
+sub PrintExecTree
+{
+    my ($outFH, $eids, $eid, $level) = @_;
+    $level = 0 unless defined $level;
+    my $e = $eids->{$eid};
+    my $exitStatus = $e->{exitStatus};
+    if (!defined $exitStatus)  {
+	$exitStatus = "$e->{exitSignal}";
+	$exitStatus =~ s/^SIG//;
+    }
+    my $dur = DiffTs($e->{startTs}, $e->{stopTs});
+    my $cmd = '';
+    $cmd .= "[$e->{cmdPath}] " unless $e->{cmdPath} eq $e->{startArgs}[0];
+    $cmd .= GetCmdString($e->{startArgs});
+    printf $outFH "%8s %8s%13s%7s %s%s\n", $e->{peid}, $e->{eid}, $dur, $exitStatus,
+	    '  ' x $level, $cmd;
+    ++$level;
+    foreach my $child (@{$e->{childEids}})  {
+	PrintExecTree($outFH, $eids, $child, $level);
+    }
+}
+
+
+sub PrintExecsXml
+{
+    my ($outFH, $execs, $indent) = @_;
+    my $eIndent = $indent;
+    ++$eIndent if defined $eIndent;
+
+    print $outFH XmlOpenTag('execs', $indent);
+    foreach my $e (@$execs)  {
+	print $outFH XmlExec($e, $eIndent);
+    }
+    print $outFH XmlCloseTag('execs', $indent);
+}
+
+
+sub PrintBuildActionsXml
+{
+    my ($outFH, $actions, $indent) = @_;
+    my $eIndent = $indent;
+    ++$eIndent if defined $eIndent;
+
+    print $outFH XmlOpenTag('build-actions', $indent);
+    foreach my $a (@$actions)  {
+	print $outFH XmlBuildActions($a, $eIndent);
+    }
+    print $outFH XmlCloseTag('build-actions', $indent);
+}
+
+
+sub PrintCmdAttrsXml
+{
+    my ($outFH, $path, $bi, $indent) = @_;
+    my $eIndent = $indent;
+    ++$eIndent if defined $eIndent;
+
+    print $outFH XmlOpenTag('build-cmd', $indent);
+    print $outFH XmlElem('path', $path, $eIndent);
+    print $outFH XmlElem('target', $bi->{target}, $eIndent);
+    print $outFH XmlElem('version', $bi->{version}, $eIndent);
+    print $outFH XmlCmdAttr('include-search-paths', 'paths', 'path', $bi->{includeSearch}, $eIndent);
+    print $outFH XmlCmdAttr('system-include-search-paths', 'paths', 'path', $bi->{systemIncludeSearch}, $eIndent);
+    print $outFH XmlCmdAttr('system-defines', 'defines', 'define', $bi->{defines}, $eIndent);
+    print $outFH XmlCloseTag('build-cmd', $indent);
+}
+
+
+sub PrintCmdsAttrsXml
+{
+    my ($outFH, $bi, $indent) = @_;
+    my $eIndent = $indent;
+    ++$eIndent if defined $eIndent;
+
+    print $outFH XmlOpenTag('build-cmds', $indent);
+    foreach my $path (keys %$bi)  {
+	PrintCmdAttrsXml($outFH, $path, $bi->{$path}, $eIndent);
+    }
+    print $outFH XmlCloseTag('build-cmds', $indent);
+}
+
+
+sub PrintBuildXml
+{
+    my ($outFH, $data, $indent) = @_;
+    my $eIndent = $indent;
+    ++$eIndent if defined $eIndent;
+
+    print $outFH XmlDecl('1.0', 'utf-8', $indent);
+    print $outFH XmlOpenTag('build', $indent);
+    print $outFH XmlElem('build-summary-uuid', $data->{uuid}, $eIndent);
+    print $outFH XmlElem('build-root-dir', $data->{buildRootDir}, $eIndent);
+    print $outFH XmlElem('package-root-dir', $data->{packageRootDir}, $eIndent);
+    print $outFH XmlElem('platform-name', $data->{platName}, $eIndent);
+    print $outFH XmlElem('platform-uuid', $data->{platUuid}, $eIndent);
+    print $outFH XmlElem('package-name', $data->{pkgName}, $eIndent);
+    print $outFH XmlElem('package-version', $data->{pkgVersion}, $eIndent);
+    PrintExecsXml($outFH, $data->{execs}, $eIndent);
+    print $outFH XmlBuildEids($data, $eIndent);
+    PrintBuildActionsXml($outFH, $data->{buildActions}, $eIndent);
+    PrintCmdsAttrsXml($outFH, $data->{cmdInfo}, $eIndent);
+    print $outFH XmlCloseTag('build', $indent);
+}
+
+
+sub PrintDebugInfo
+{
+    my ($outFn, $data) = @_;
+
+    open my $outFH, ">$outFn" or die "open $outFn}: $!";
+
+    print $outFH "-----\ninitial working directory\n-----\n";
+    print $outFH "$data->{initialCwd}\n";
+
+    print $outFH "-----\nsys call counts\n-----\n";
+    my $callCount = $data->{callCount};
+    foreach my $c (sort keys %$callCount)  {
+	$callCount->{$c}{good} = 0 unless exists $callCount->{$c}{good};
+	$callCount->{$c}{fail} = 0 unless exists $callCount->{$c}{fail};
+	printf $outFH "%8d  %8d  %s\n", $callCount->{$c}{good}, $callCount->{$c}{fail}, $c;
+    }
+
+    print $outFH "-----\ncloneOpts\n-----\n";
+    foreach my $v (sort keys %{$data->{cloneOpts}})  {
+	print $outFH "$v\n";
+    }
+
+    print $outFH "-----\nexecs\n-----\n";
+    foreach my $e (@{$data->{execs}})  {
+	my $exitStatus = $e->{exitStatus};
+	$exitStatus = $e->{exitSignal} unless defined $exitStatus;
+	my $dur = DiffTs($e->{startTs}, $e->{stopTs});
+	printf $outFH "%8s %8s %13s %s  = %s     cwd=%s\n", $e->{peid}, $e->{eid}, $dur,
+		$e->{cmdPath}, $exitStatus, $e->{startCwd};
+    }
+
+    print $outFH "-----\ncmdPaths\n-----\n";
+    foreach my $p (sort keys %{$data->{cmdPaths}})  {
+	printf $outFH "%6d %s\n", $data->{cmdPaths}{$p}, $p;
+    }
+
+    print $outFH "-----\nexec tree hierarchy\n-----\n";
+    PrintExecTree($outFH, $data->{eids}, $data->{rootEid});
+
+    #print $outFH "-----\ndata\n-----\n";
+    #print $outFH Dumper($data), "\n";
+
+    close $outFH or die "close $outFn}: $!";
+}
+
+
+sub XmlEscape
+{
+    my $s = shift;
+    return $s unless defined $s;
+
+    my %esc = ('&' => '&amp;', '<' => '&lt;', '>' => '&gt;');
+
+    $s =~ s/([&<>])/$esc{$1}/g;
+
+    return $s;
+}
+
+
+sub XmlUnescape
+{
+    my $s = shift;
+    return $s unless defined $s;
+
+    my %esc = (amp => '&', 'lt' => '<', 'gt' => '>', apos => "'", quote => '"');
+
+    $s =~ s/&(amp|lt|gt|apos|quote);/$esc{$1}/g;
+
+    return $s;
+}
+
+
+sub XmlDecl
+{
+    my ($ver, $enc, $indent) = @_;
+
+    my $end;
+    if (defined $indent)  {
+	$end = "\n";
+    }  else  {
+	$end = '';
+	$indent = 0;
+    }
+
+    my $s = (' ' x $indent) .  "<?xml version='$ver' encoding='$enc'?>$end";
+
+    return $s;
+}
+
+
+sub XmlElemRawContents
+{
+    my ($tag, $contents, $indent) = @_;
+
+    return '' unless defined $contents;
+
+    my $end;
+    if (defined $indent)  {
+	$end = "\n";
+    }  else  {
+	$end = '';
+	$indent = 0;
+    }
+
+    my $s = (' ' x $indent) . "<$tag>$contents</$tag>$end";
+
+    return $s;
+}
+
+
+sub XmlElem
+{
+    my ($tag, $contents, $indent) = @_;
+
+    return XmlElemRawContents($tag, XmlEscape($contents), $indent);
+}
+
+
+sub XmlOpenTag
+{
+    my ($tag, $indent) = @_;
+    my $end;
+    if (defined $indent)  {
+	$end = "\n";
+    }  else  {
+	$end = '';
+	$indent = 0;
+    }
+
+    my $s = (' ' x $indent) . "<$tag>$end";
+
+    return $s;
+}
+
+
+sub XmlCloseTag
+{
+    my ($tag, $indent) = @_;
+    my $end;
+    if (defined $indent)  {
+	$end = "\n";
+    }  else  {
+	$end = '';
+	$indent = 0;
+    }
+
+    my $s = (' ' x $indent) . "</$tag>$end";
+
+    return $s;
+}
+
+
+sub XmlArrayRawContents
+{
+    my ($arrayTag, $elemTag, $elems, $indent) = @_;
+    my $eIndent;
+    $eIndent = $indent + 1 if defined $indent;
+    my $s = '';
+
+    if (@$elems)  {
+	$s .= XmlOpenTag($arrayTag, $indent);
+	for my $v (@$elems)  {
+	    $s .= XmlElemRawContents($elemTag, $v, $eIndent);
+	}
+	$s .= XmlCloseTag($arrayTag, $indent);
+    }
+
+    return $s;
+}
+
+
+sub XmlArray
+{
+    my ($arrayTag, $elemTag, $elems, $indent) = @_;
+    my $eIndent;
+    $eIndent = $indent + 1 if defined $indent;
+    my $s = '';
+
+    if (defined $elems && @$elems)  {
+	$s .= XmlOpenTag($arrayTag, $indent);
+	for my $v (@$elems)  {
+	    $s .= XmlElem($elemTag, $v, $eIndent);
+	}
+	$s .= XmlCloseTag($arrayTag, $indent);
+    }
+
+    return $s;
+}
+
+
+sub XmlFileType
+{
+    my ($bi, $f) = @_;
+
+    return XmlElem('path', $f) . XmlElem('type', $bi->{fileTypes}{$f})
+}
+
+
+sub XmlBuildInfo
+{
+    my ($bi, $indent) = @_;
+
+    my $s = '';
+    my $eIndent = $indent;
+    ++$eIndent if defined $eIndent;
+
+    $s .= XmlOpenTag('build-info', $indent);
+    $s .= XmlElem('op', $bi->{op}, $eIndent);
+    $s .= XmlElem('build-exec-type', $bi->{buildExecType}, $eIndent);
+    $s .= XmlElem('out-file', $bi->{outFile}, $eIndent);
+    if (@{$bi->{files}})  {
+	my @files = map {XmlFileType($bi, $_)} @{$bi->{files}};
+	$s .= XmlArrayRawContents('files', 'file', \@files, $eIndent);
+    }
+    if (@{$bi->{defines}})  {
+	$s .= XmlArray('defines', 'def', $bi->{defines}, $eIndent);
+    }
+    $s .= XmlArray('dialect', 'opt', $bi->{dialect}, $eIndent);
+    $s .= XmlArray('include', 'path', $bi->{include}, $eIndent)
+		    if exists $bi->{include};
+    $s .= XmlArray('include-search', 'path', $bi->{includeSearch}, $eIndent)
+		    if exists $bi->{includeSearch};
+    $s .= XmlArray('lib-search', 'path', $bi->{libSearch}, $eIndent)
+		    if exists $bi->{libSearch};
+    $s .= XmlCloseTag('build-info', $indent);
+
+    return $s;
+}
+
+
+sub XmlExecAttrs
+{
+    my ($executable, $args, $env, $cwd, $indent) = @_;
+    my $s = '';
+
+    $s .= XmlElem('cwd', $cwd, $indent);
+    $s .= XmlArray('environment', 'env', GetEnvArray($env), $indent);
+    $s .= XmlElem('executable', $executable, $indent);
+    $s .= XmlArray('args', 'arg', $args, $indent);
+
+    return $s;
+}
+
+
+sub XmlExec
+{
+    my ($e, $indent) = @_;
+
+    my $s = '';
+    my $eIndent = $indent;
+    ++$eIndent if defined $eIndent;
+
+    $s .= XmlOpenTag('exec', $indent);
+    $s .= XmlElem('eid', $e->{eid}, $eIndent);
+    $s .= XmlElem('peid', $e->{peid}, $eIndent);
+    $s .= XmlElem('start-ts', $e->{startTs}, $eIndent);
+    $s .= XmlElem('stop-ts', $e->{stopTs}, $eIndent);
+    $s .= XmlElem('exit-status', $e->{exitStatus}, $eIndent);
+    $s .= XmlElem('exit-signal', $e->{exitSignal}, $eIndent);
+    $s .= XmlElem('exit-signal-msg', $e->{exitSignalMsg}, $eIndent);
+    $s .= XmlExecAttrs($e->{cmdPath}, $e->{startArgs}, $e->{startEnv}, $e->{startCwd}, $eIndent);
+    $s .= XmlArray('child-eids', 'eid', $e->{childEids}, $eIndent);
+    $s .= XmlBuildInfo($e->{buildInfo}, $eIndent) if exists $e->{buildInfo};
+    $s .= XmlCloseTag('exec', $indent);
+
+    return $s;
+}
+
+
+sub XmlActionFileType
+{
+    my ($f) = @_;
+
+    return XmlElem('path', $f->{path}) . XmlElem('type', $f->{type});
+}
+
+
+sub XmlBuildActions
+{
+    my ($action, $indent) = @_;
+
+    my $s = '';
+    my $eIndent = $indent;
+    ++$eIndent if defined $eIndent;
+
+    $s .= XmlOpenTag('build-action', $indent);
+    $s .= XmlElem('op', $action->{op}, $eIndent);
+    $s .= XmlElem('eid', $action->{eid}, $eIndent);
+    $s .= XmlElem('out-file', $action->{outFile}, $eIndent);
+    if (@{$action->{inFiles}})  {
+	my @files = map {XmlActionFileType($_)} @{$action->{inFiles}};
+	$s .= XmlArrayRawContents('in-files', 'file', \@files, $eIndent);
+    }
+    $s .= XmlCloseTag('build-action', $indent);
+
+    return $s;
+}
+
+
+sub XmlCmdAttr
+{
+    my ($tag, $arrayTag, $elemTag, $attrs, $indent) = @_;
+
+    my $s = '';
+    my $eIndent = $indent;
+    ++$eIndent if defined $eIndent;
+
+    for my $lang (sort keys %$attrs)  {
+	$s .= XmlOpenTag($tag, $indent);
+	$s .= XmlElem('lang', $lang, $eIndent);
+	$s .= XmlArray($arrayTag, $elemTag, $attrs->{$lang}, $eIndent);
+	$s .= XmlCloseTag($tag, $indent);
+    }
+
+    return $s;
+}
+
+
+sub XmlBuildEids
+{
+    my ($data, $indent) = @_;
+
+    my $s = XmlArray('build-eids', 'eid', $data->{buildEids}, $indent);
+
+    return $s;
+}
+
+
+sub XmlCommand
+{
+    my ($executable, $args, $env, $cwd, $indent) = @_;
+
+    my $s = '';
+    my $eIndent = $indent;
+    ++$eIndent if defined $eIndent;
+
+    $s .= XmlOpenTag('command', $indent);
+    $s .= XmlExecAttrs($executable, $args, $env, $cwd, $eIndent);
+    $s .= XmlCloseTag('command', $indent);
+    
+    return $s;
+}
+
+
+sub XmlAssessment
+{
+    my ($executable, $args, $env, $cwd, $report, $stdout, $stderr, $reportId,
+	    $exitCode, $exitSignal, $startTs, $stopTs, $indent) = @_;
+
+    my $s = '';
+    my $eIndent = $indent;
+    ++$eIndent if defined $eIndent;
+
+    $s .= XmlOpenTag('assessment', $indent);
+    $s .= XmlElem('report', $report, $eIndent);
+    $s .= XmlElem('stdout', $stdout, $eIndent);
+    $s .= XmlElem('stderr', $stderr, $eIndent);
+    $s .= XmlElem('build-artifact-id', $reportId, $eIndent);
+    $s .= XmlElem('exit-code', $exitCode, $eIndent);
+    $s .= XmlElem('exit-signal', $exitSignal, $eIndent);
+    $s .= XmlElem('start-ts', $startTs, $eIndent);
+    $s .= XmlElem('stop-ts', $stopTs, $eIndent);
+    $s .= XmlCommand($executable, $args, $env, $cwd, $eIndent);
+    $s .= XmlCloseTag('assessment', $indent);
+    
+    return $s;
+}
+
+
+sub HasValue
+{
+    my $s = shift;
+    return defined $s && $s ne '';
+}
+
+
+# return 0	if $b is 0  false  no   <undefined>  <empty>
+# return 1	if $b is 1  true   yes
+# return undef  if $b is anything else
+sub BoolValue
+{
+    my $b = shift;
+
+    return 0 if !HasValue($b) || $b =~ /^(0|false|no)$/i;
+    return 1 if $b =~ /^(1|true|yes)$/i;
+    return undef;
+}
+
+
+# Read a configuration file containing keys and values, returning a reference to
+# a hash containing the keys mapped to values.  The key and value are separated
+# by the '=' and more generally ':<MODIFIER_CHARS>='.  The MODIFIER_CHARS allow
+# the value to contain arbitrary whitespace and new-line characters.  The
+# MODIFIER_CHARS are case insensitive.
+#
+# The key is the characters from the current place in the file to the first '='
+# or last ':' before the first '='.  Leading and trailing whitespace surrounding
+# the key are removed (all other characters are preserved).  Duplicate keys
+# replace prior values.
+#
+# Configuration file lines are of the following form:
+#
+# - blank or all whitespace lines are skipped
+# - comment lines (first non-whitespace is a '#') are skipped
+# - k = v		adds k => v to hash, leading and trailing whitespace is
+# 			removed
+# - k :<COUNT>L=v	add k => VALUE to hash, where VALUE is the next <COUNT>
+# 			lines with whitespace and new lines preserved, except
+# 			the final new line.  If the file does not contain
+# 			<COUNT> additional lines it is an error.
+# - k :=v		same at 'k :1L=v'
+# - k :<COUNT>C=v	add k => Value to hash, where VALUE is the next <COUNT>
+# 			characters after the '=' with whitespace and new lines
+# 			preserved,  If the file does not contain <COUNT>
+# 			additonal characters it is an error.  Processing of the
+# 			next key begins at the next character even if it is on
+# 			the same line as part of the value.
+# - other lines such as those lacking a '=', or an empty key after whitespace
+#   removal are errors
+#
+# To aid human readability of configuration files, creators of configuration
+# files are encouraged to use 'k = v' where the value does not contain a leading
+# or trailing whitespace and there are no new line characters in v, 'k :=v'
+# where v does not contain a new-line character, and one of the other forms only
+# when v contains a new-line character.  Comments and blank lines can be used to
+# increase readability.  If the 'k :<COUNT>C=v' form is used a new-line is
+# encouraged after the value so each key starts on its own line.
+#
+#
+sub ReadConfFile
+{
+    my ($filename, $required) = @_;
+    my $lineNum = 0;
+    my $colNum = 0;
+    my $linesToRead = 0;
+    my $charsToRead = 0;
+    my %h;
+    $h{'#filenameofconffile'} = $filename;
+
+    open my $confFile, "<$filename" or die "Open configuration file '$filename' failed: $!";
+    my ($line, $k, $kLine, $err);
+    while (1)  {
+	if (!defined $line)  {
+	    $line = <$confFile>;
+	    last unless defined $line;
+	    ++$lineNum;
+	    $colNum = 1;
+	}
+
+	if ($linesToRead > 0)  {
+	    --$linesToRead;
+	    chomp $line if $linesToRead == 0;
+	    $h{$k} .= $line;
+	}  elsif ($charsToRead > 0)  {
+	    my $v = substr($line, 0, $charsToRead, '');
+	    $colNum = length $v;
+	    $charsToRead -= $colNum;
+	    $h{$k} .= $v;
+	    redo if length $line > 0;
+	}  elsif ($line !~ /^\s*(#|$)/)  {
+	    # line is not blank or a comment (first non-whitespace is a '#')
+	    if ($line =~ /^\s*(.*?)\s*(?::([^:]*?))?=(\s*(.*?)\s*)$/)  {
+		my ($u, $wholeV, $v) = ($2, $3, $4);
+		$k = $1;
+		$kLine = $lineNum;
+		if ($k eq '')  {
+		    chomp $line;
+		    $err = "missing key, line is '$line'";
+		    last;
+		}
+		if (!defined $u)  {
+		    # normal 'k = v' line
+		    $h{$k} = $v;
+		}  else  {
+		    # 'k :<COUNT><UNIT>= v' line
+		    $u = '1L' if $u eq '';
+		    if ($u =~ /^(\d+)L$/i)  {
+			$linesToRead = $1;
+		    }  elsif ($u =~ /^(\d+)C$/i)  {
+			$charsToRead = $1;
+			$colNum = length($line) - length($wholeV);
+		    }  else  {
+			$err = "unknown units ':$u='";
+			last;
+		    }
+		    $h{$k} = '';
+		    $line = $wholeV;
+		    redo;
+		}
+	    }  else  {
+		chomp $line;
+		$err = "bad line (no '='), line is '$line'";
+		last;
+	    }
+	}
+	undef $line;
+    }
+    close $confFile or defined $err or die "Close configuration file '$filename' failed: $!";
+
+    if (defined $err)  {
+	my $loc = "line $lineNum";
+	$loc .= " column $colNum" unless $colNum == 1;
+	die "Configuration file '$filename' $loc $err";
+    }
+
+    if ($linesToRead > 0)  {
+	die "Configuration file '$filename' missing $linesToRead lines for key '$k' at line $kLine";
+    }
+
+    if ($charsToRead > 0)  {
+	die "Configuration file '$filename' missing $charsToRead characters for key '$k' at line $kLine";
+    }
+
+    if (defined $required)  {
+	my @missing = grep { !HasValue $h{$_}; } @$required;
+	if (@missing)  {
+	    die "Configuration file '$filename' missing required keys: " . join(", ", @missing);
+	}
+    }
+
+    return \%h;
+}
+
+
+
+# NormalizePath - take a path and remove empty and '.' directory components
+#                 empty directories become '.'
+#
+sub NormalizePath
+{
+    my $p = shift;
+    die "NormalizePath: path undef" unless defined $p;
+
+    $p =~ s/\/\/+/\//g;                 # collapse consecutive /'s to one /
+    $p =~ s/\/(\.\/)+/\//g;             # change /./'s to one /
+    $p =~ s/^\.\///;                    # remove initial ./
+    $p = '.' if $p eq '';               # change empty dirs to .
+    $p =~ s/\/\.$/\//;                  # remove trailing . directory names
+    $p =~ s/\/$// unless $p eq '/';     # remove trailing /
+
+    return $p;
+}
+
+
+# AdjustPath - take a path that is relative to curDir and make it relative
+#              to baseDir.  If the path is not in baseDir, do not modify.
+#
+#       baseDir    - the directory to make paths relative to
+#       curDir     - the directory paths are currently relative to
+#       path       - the path to change
+#
+sub AdjustPath
+{
+    my ($baseDir, $curDir, $path) = @_;
+
+    $baseDir = NormalizePath($baseDir);
+    $curDir = NormalizePath($curDir);
+    $path = NormalizePath($path);
+
+    # if path is relative, prefix with current dir
+    if ($path eq '.')  {
+        $path = $curDir;
+    }  elsif ($curDir ne '.' && $path !~ /^\//)  {
+        $path = "$curDir/$path";
+    }
+
+    # remove initial baseDir from path if baseDir is not empty
+    $path =~ s/^\Q$baseDir\E\///;
+
+    return $path;
+}
+
+
+# FormOptValue - return a list of option and value,
+#                if the options ends in '=' option and value are one arg
+#
+sub FormOptValue
+{
+    my ($o, $v) = @_;
+    my @opts;
+
+    if (defined $o)  {
+	die "FormOptValue($o) value undef" unless defined $v;
+	if ($o =~ /=$/)  {
+	    @opts = ( "$o$v" );
+	}  else  {
+	    @opts = ( $o, $v );
+	}
+    }
+
+    return @opts;
+}
+
+
+# GetOptValue - return opt value or undef if opt does not exist
+#
+#
+sub GetOptValue
+{
+    my ($h, $k) = @_;
+
+    if (exists $h->{$k})  {
+	return $h->{$k};
+    }  else  {
+	return undef;
+    }
+}
+
+
+sub GetArgMax
+{
+    use POSIX qw(sysconf);
+    my $s = POSIX::sysconf(&POSIX::_SC_ARG_MAX) or
+	    die "sysconf(_SC_ARG_MAX) failed; $!";
+    return $s;
+}
+
+
+
+############################## Metrics #############################
+
+sub DoMetricAssessment
+{
+    my ($data, $toolType, $resultsDir, $toolPath, $toolOpt, $toolConfFile, $toolDir,
+		$servicesConfFile, $toolsBaseDir) = @_;
+
+    my ($pass, $fail, $skip) = (0, 0);
+    my $uuid = GetUuid();
+    my $pkgPath = getcwd();
+    my $assessStartTs = GetCurTs();
+    my $toolVersion = '';
+    my $toolConf = ReadConfFile($toolConfFile, [qw/tool-input tool-output tool-output-file/]);
+    my @toolOpts;
+    @toolOpts = split ' ', $toolConf->{'tool-opts'} if exists $toolConf->{'tool-opts'};
+    my $toolInput = GetOptValue($toolConf, 'tool-input');
+    my $toolInputOpt = GetOptValue($toolConf, 'tool-input-opt');
+    my $toolInputFile = GetOptValue($toolConf, 'tool-input-file');
+    my $toolOutput = GetOptValue($toolConf, 'tool-output');
+    my $toolOutputOpt = GetOptValue($toolConf, 'tool-output-opt');
+    my $toolOutputFile = GetOptValue($toolConf, 'tool-output-file');
+    die "invalid tool-input '$toolInput' in $toolConfFile"
+	    unless $toolInput =~ /^(list-file|(inf|\d+)-args?)$/;
+    die "invalid tool-output '$toolOutput' in $toolConfFile"
+	    unless $toolOutput =~ /^(stdout|stderr|file)$/;
+    die "missing NUM in tool-output-file '$toolOutputFile' in $toolConfFile not set"
+	    unless $toolOutputFile =~ /NUM/;
+    die "tool-input-file not set in $toolConfFile"
+	    if $toolInput eq 'list-file' && !HasValue $toolInputFile;
+    my $lang = GetOptValue($toolConf, 'setenv-LANG');
+
+    open TOOLVER, '-|', $toolPath, '--version' or die "open $toolPath --version|: $!";
+    while (<TOOLVER>)  {
+	$toolVersion .= $_;
+    }
+    close TOOLVER or die "close $toolPath --version|: $!";
+    chomp $toolVersion;
+
+    my $asFile = "$resultsDir/assessment_summary.xml";
+    open ASFILE, ">", $asFile or die "open $asFile: $!";
+    my $indent = 0;
+    my ($indent1, $indent2);
+    if (defined $indent)  {
+	$indent1 = $indent + 1;
+	$indent2 = $indent1 + 1;
+    }
+    print ASFILE XmlDecl('1.0', 'utf-8', $indent);
+    print ASFILE XmlOpenTag('assessment-summary', $indent);
+    print ASFILE XmlElem('assessment-summary-uuid', $uuid, $indent1);
+    print ASFILE XmlElem('build-summary-uuid', $data->{uuid}, $indent1);
+    print ASFILE XmlElem('build-root-dir', $data->{buildRootDir}, $indent1);
+    print ASFILE XmlElem('package-root-dir', $data->{packageRootDir}, $indent1);
+    print ASFILE XmlElem('platform-name', $data->{platName}, $indent1);
+    print ASFILE XmlElem('platform-uuid', $data->{platUuid}, $indent1);
+    print ASFILE XmlElem('package-name', $data->{pkgName}, $indent1);
+    print ASFILE XmlElem('package-version', $data->{pkgVersion}, $indent1);
+    print ASFILE XmlElem('tool-type', $toolType, $indent1);
+    print ASFILE XmlElem('tool-version', $toolVersion, $indent1);
+    print ASFILE XmlOpenTag('assessment-artifacts', $indent1);
+
+    my %files;
+    for my $a (@{$data->{buildActions}})  {
+	my $op = $a->{op};
+	my $eid = $a->{eid};
+	my $inFileType = $a->{inFiles}[0]{type};
+	my $inFilePath = $a->{inFiles}[0]{path};
+	next unless $a->{op} eq 'compile' && $inFileType =~ /^c(\+\+)?$/;
+
+	my $e = $data->{eids}{$eid};
+
+	my $cwd = $e->{startCwd};
+
+	if (!-d $cwd)  {
+	    ++$skip;
+	    print STDERR "WARNING: directory '$cwd' does not exist, skipping\n";
+	    next;
+	}
+	$inFilePath = AdjustPath($pkgPath, $cwd, $inFilePath);
+	if (!-f $inFilePath)  {
+	    ++$skip;
+	    print STDERR "WARNING: source file '$inFilePath' does not exist, skipping\n";
+	    next;
+	}
+	$files{$inFilePath}++;
+    }
+
+    my @files = sort keys %files;
+    my $id = 0;
+    my $argMax = GetArgMax();
+    $argMax -= length join ' ', (%ENV);
+    $argMax = $argMax * 3 / 4;
+
+    while (@files)  {
+	my @inputOpts = ();
+	my @fileArgs = ();
+	if ($toolInput eq 'list-file')  {
+	    my $toolInputPath = AdjustPath('', $resultsDir, $toolInputFile);
+	    @inputOpts = FormOptValue($toolInputOpt, $toolInputPath);
+	    WriteFile($toolInputPath, join("\n", @files) . "\n");
+	    @files = ();
+	}  else  {
+	    my ($maxCount) = ($toolInput =~ /^(.+)-args?$/);
+	    $maxCount = 0 if $maxCount eq 'inf';
+	    my $count = 0;
+	    my $argSize = 0;
+	    while ($maxCount <= 0 || $count < $maxCount)  {
+		last unless @files;
+		my $f = shift @files;
+		$argSize += length($f) + 1;
+		if ($count > 0 && $argSize > $argMax)  {
+		    unshift @files, $f;
+		    last;
+		}
+		push @fileArgs, $f;
+		++$count;
+	    }
+	}
+
+	my @outputOpts = ();
+	my $stdoutFileName = "stdout${id}.out";
+	my $stderrFileName = "stderr${id}.out";
+	my $reportFileName = "$toolOutputFile";
+	$reportFileName =~ s/NUM/$id/;
+
+	if ($toolOutput eq 'stdout')  {
+	    $stdoutFileName = $reportFileName;
+	}  elsif ($toolOutput eq 'stderr')  {
+	    $stderrFileName = $reportFileName;
+	}  elsif ($toolOutput eq 'file')  {
+	    my $reportPath = AdjustPath('', $resultsDir, $reportFileName);
+	    @outputOpts = FormOptValue($toolOutputOpt, $reportPath);
+	}  else  {
+	    die "unknown tool-output '$toolOutput'";
+	}
+
+	my $stdoutPath = AdjustPath('', $resultsDir, $stdoutFileName);
+	my $stderrPath = AdjustPath('', $resultsDir, $stderrFileName);
+
+	my @cmd = ( $toolPath, @toolOpts, @inputOpts, @outputOpts, @fileArgs );
+	my %myEnv = %ENV;
+	$myEnv{LANG} = $lang if HasValue $lang;
+
+	my $startTs = GetCurTs();
+	my ($exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus)
+		= ExecCmd(\@cmd, \%myEnv, undef, $stdoutPath, $stderrPath);
+	my $stopTs = GetCurTs();
+	if ($exitStatus == 0)  {
+	    ++$pass;
+	}  else  {
+	    ++$fail;
+	    print STDERR "# Error: ", GetExecErrorMsg(\@cmd, $exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus), "\n";
+	}
+	print ASFILE XmlAssessment($cmd[0], \@cmd, \%myEnv, $pkgPath,
+		$reportFileName, $stdoutFileName, $stderrFileName, $id,
+		$exitCode, $exitSignalName, $startTs, $stopTs, $indent2);
+    }
+
+    my $assessStopTs = GetCurTs();
+
+    print ASFILE XmlCloseTag('assessment-artifacts', $indent1);
+    print ASFILE XmlElem('start-ts', $assessStartTs, $indent1);
+    print ASFILE XmlElem('stop-ts', $assessStopTs, $indent1);
+    print ASFILE XmlCloseTag('assessment-summary', $indent);
+    close ASFILE or die "close $asFile: $!";
+
+    return ($pass, $fail, $skip);
+}
+
+
+
+############################## cppcheck #############################
+
+
+sub DoCppcheckAssessment
+{
+    my ($data, $toolType, $resultsDir, $toolPath, $toolOpt, $toolConfFile, $toolDir,
+		$servicesConfFile, $toolsBaseDir) = @_;
+
+    my ($pass, $fail, $skip) = (0, 0);
+    my $uuid = GetUuid();
+    my $id = 0;
+    my $savedCwd = getcwd();
+    my $assessStartTs = GetCurTs();
+    my $toolVersion = '';
+    my $toolConf = ReadConfFile($toolConfFile);
+    my $enables = 'warning,style';
+    $enables = join ',', split /[, ]/, $toolConf->{'tool-cppcheck-enable'} if exists $toolConf->{'tool-cppcheck-enable'};
+    my @useLibraries;
+    @useLibraries = map {"--library=$_"} split /[, ]/, $toolConf->{'tool-cppcheck-library'} if exists $toolConf->{'tool-cppcheck-library'};
+    my $systemIncludeDirs;
+    if (exists $toolConf->{'tool-cppcheck-system-include-dirs'})  {
+	my $v = $toolConf->{'tool-cppcheck-system-include-dirs'};
+	$systemIncludeDirs = BoolValue($v);
+	die "invalid boolean value '$v' for option 'tool-cppcheck-system-include-dirs' in file '$toolConfFile'" unless defined $systemIncludeDirs;;
+    }  else  {
+	$systemIncludeDirs = defined $toolOpt && $toolOpt =~ /\bsystemincludedirs\b/i;
+    }
+
+    open TOOLVER, '-|', $toolPath, '--version' or die "open $toolPath --version|: $!";
+    while (<TOOLVER>)  {
+	$toolVersion .= $_;
+    }
+    close TOOLVER or die "close $toolPath --version|: $!";
+    chomp $toolVersion;
+
+    my $asFile = "$resultsDir/assessment_summary.xml";
+    open ASFILE, ">", $asFile or die "open $asFile: $!";
+    my $indent = 0;
+    my ($indent1, $indent2);
+    if (defined $indent)  {
+	$indent1 = $indent + 1;
+	$indent2 = $indent1 + 1;
+    }
+    print ASFILE XmlDecl('1.0', 'utf-8', $indent);
+    print ASFILE XmlOpenTag('assessment-summary', $indent);
+    print ASFILE XmlElem('assessment-summary-uuid', $uuid, $indent1);
+    print ASFILE XmlElem('build-summary-uuid', $data->{uuid}, $indent1);
+    print ASFILE XmlElem('build-root-dir', $data->{buildRootDir}, $indent1);
+    print ASFILE XmlElem('package-root-dir', $data->{packageRootDir}, $indent1);
+    print ASFILE XmlElem('platform-name', $data->{platName}, $indent1);
+    print ASFILE XmlElem('platform-uuid', $data->{platUuid}, $indent1);
+    print ASFILE XmlElem('package-name', $data->{pkgName}, $indent1);
+    print ASFILE XmlElem('package-version', $data->{pkgVersion}, $indent1);
+    print ASFILE XmlElem('tool-type', $toolType, $indent1);
+    print ASFILE XmlElem('tool-version', $toolVersion, $indent1);
+    print ASFILE XmlOpenTag('assessment-artifacts', $indent1);
+
+    for my $a (@{$data->{buildActions}})  {
+	my $op = $a->{op};
+	my $eid = $a->{eid};
+	my $inFileType = $a->{inFiles}[0]{type};
+	my $inFilePath = $a->{inFiles}[0]{path};
+	next unless $a->{op} eq 'compile' && $inFileType =~ /^c(\+\+)?$/;
+
+	my $e = $data->{eids}{$eid};
+	my $bi = $e->{buildInfo};
+
+	my $env = $e->{startEnv};
+	my $cwd = $e->{startCwd};
+	my $buildCmdOpts = GetBuildCommandOpts($data, $a);
+	my @systemIncludeDirs = ();
+	my @extraOpts;
+	if ($systemIncludeDirs)  {
+	    @systemIncludeDirs = ( @{$buildCmdOpts->{includeSearch}}, @{$buildCmdOpts->{systemIncludeSearch}} )
+	}
+	my @cmd = ($toolPath,
+		    "--xml-version=2",
+		    "--enable=$enables",
+		    "--language=$inFileType",
+		    "--quiet",
+		    @useLibraries,
+		    @{$buildCmdOpts->{defines}},
+		    @{$bi->{defines}},
+		    (map {"-I$_"} @{$bi->{includeSearch}}, @systemIncludeDirs),
+		    (map {"--include=$_"} @{$bi->{include}}),
+		    @extraOpts,
+		    $inFilePath
+		    );
+
+	print STDERR "cd ", BashQuote($cwd), " ; ", GetCmdString(\@cmd), "\n";
+	if (!-d $cwd)  {
+	    ++$skip;
+	    print STDERR "WARNING: directory '$cwd' does not exist, skipping\n";
+	    next;
+	}
+	chdir $cwd or die "chdir $cwd";
+	if (!-f $inFilePath)  {
+	    ++$skip;
+	    print STDERR "WARNING: source file '$inFilePath' does not exist, skipping\n";
+	    next;
+	}
+	#jk my $outFile = '/dev/null';
+	my $outFile;
+	++$id;
+	my $resultFileName = "assessment_report${id}.xml";
+	my $resultFile = "$resultsDir/$resultFileName";
+	my $startTs = GetCurTs();
+	my ($exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus)
+		= ExecCmd(\@cmd, $env, undef, $outFile, $resultFile);
+	my $stopTs = GetCurTs();
+	if ($exitStatus == 0)  {
+	    ++$pass;
+	}  else  {
+	    ++$fail;
+	    print STDERR "# Error: ", GetExecErrorMsg(\@cmd, $exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus), "\n";
+	}
+	print ASFILE XmlAssessment($cmd[0], \@cmd, $env, $cwd, $resultFileName, undef, undef, $id,
+	    $exitCode, $exitSignalName, $startTs, $stopTs, $indent2);
+    }
+
+    chdir $savedCwd or die "chdir $savedCwd: $!";
+    my $assessStopTs = GetCurTs();
+
+    print ASFILE XmlCloseTag('assessment-artifacts', $indent1);
+    print ASFILE XmlElem('start-ts', $assessStartTs, $indent1);
+    print ASFILE XmlElem('stop-ts', $assessStopTs, $indent1);
+    print ASFILE XmlCloseTag('assessment-summary', $indent);
+    close ASFILE or die "close $asFile: $!";
+
+    return ($pass, $fail, $skip);
+}
+
+
+
+############################## Clang SA #############################
+
+
+sub DiffEnv
+{
+    my ($oldEnvArray, $newEnvArray) = @_;
+    my (%added, %removed, %updated);
+    my $oldEnv = GetEnvHashFromArray($oldEnvArray);
+    my $newEnv = GetEnvHashFromArray($newEnvArray);
+
+    for my $k (keys %$oldEnv)  {
+	if (exists $newEnv->{$k})  {
+	    if ($oldEnv->{$k} ne $newEnv->{$k})  {
+		$updated{$k} = $newEnv->{$k};
+	    }
+	}  else  {
+	    $removed{$k} = undef;
+	}
+    }
+
+    for my $k (keys %$newEnv)  {
+	if (!exists $oldEnv->{$k})  {
+	    $added{$k} = $newEnv->{$k};
+	}
+    }
+
+    return (\%added, \%removed, \%updated);
+}
+
+
+sub BashSetEnvCmd
+{
+    my ($k, $v) = @_;
+    my $cmd = '';
+
+    # exported Bash functions are now BASH_FUNC_name() or BASH_FUNC_name%%
+    if ($k =~ /^BASH_FUNC_(.*)(\(\)|\%\%)$/)  {
+	my $funcName = $1;
+	if ($v =~ /^\(\)\s+{.*}\s*$/)  {
+	    $cmd .= "$funcName $v\n";
+	    $cmd .= "export -f $funcName\n";
+	}  else  {
+	    $v =~ s/(.*)\n/#$1\n/g;
+	    $cmd .= "# malformed environment function body:  $v\n";
+	    print STDERR "# malformed environment function body:  $k\n";
+	}
+    }  elsif ($k =~ /^[_a-zA-Z]\w*$/)  {
+	my $quotedV = BashQuote($v);
+	$cmd .= "export $k=$quotedV\n";
+    }  else  {
+	$k =~ s/(.*)\n/#$1\n/g;
+	$cmd .= "# malformed environment variable name:  $k\n";
+	print STDERR "# malformed environment variable name:  $k\n";
+    }
+
+    return $cmd;
+}
+
+
+sub BashUnsetEnvCmd
+{
+    my ($k, $v) = @_;
+    my $cmd;
+
+    # exported Bash functions are now BASH_FUNC_name() or BASH_FUNC_name%%
+    if ($k =~ /^BASH_FUNC_(.*)(\(\)|\%\%)$/)  {
+	my $funcName = $1;
+	$cmd .= "unset -f $funcName\n";
+    }  elsif ($k =~ /^[_a-zA-Z]\w*$/)  {
+	$cmd .= "unset $k\n";
+    }  else  {
+	$k =~ s/(.*)\n/#$1\n/g;
+	$cmd .= "# malformed environment variable name for unset:  $k\n";
+	print STDERR "# malformed environment variable name for unset:  $k\n";
+    }
+
+    return $cmd;
+}
+
+
+sub GetBashBuildCmds
+{
+    my ($e, $prevDir, $prevEnv, $ccCmd, $cxxCmd) = @_;
+    my $buildExecType = $e->{buildInfo}{buildExecType};
+
+    if ($buildExecType eq 'gcc' || $buildExecType eq 'g++')  {
+	my $s = '';
+	my $dir = $e->{startCwd};
+	my $env = $e->{startEnv};
+	my @args = @{$e->{startArgs}};
+
+	my ($added, $removed, $updated) = DiffEnv($prevEnv, $env);
+	foreach my $k (sort keys %$added)  {
+	    next if $k =~ /^C(C|XX)$/;
+	    my $v = $added->{$k};
+	    $s .= BashSetEnvCmd($k, $v);
+	}
+	foreach my $k (sort keys %$updated)  {
+	    next if $k =~ /^C(C|XX)$/;
+	    my $v = $updated->{$k};
+	    $s .= BashSetEnvCmd($k, $v);
+	}
+	foreach my $k (sort keys %$removed)  {
+	    next if $k =~ /^C(C|XX)$/;
+	    $s .= BashUnsetEnvCmd($k);
+	}
+	$s .= "\n" unless $s eq '';
+
+	$s .= "cd " . BashQuote($dir) . "\n\n" unless $dir eq $prevDir;
+
+	shift @args;
+	$s .= '$CC ' if $buildExecType eq 'gcc';
+	$s .= '$CXX ' if $buildExecType eq 'g++';
+	$s .= GetCmdString(\@args) . "\n";
+
+	return ($s, $dir, $env);
+    }  else  {
+	return (undef, $prevDir, $prevEnv);
+    }
+}
+
+
+sub WriteBuildFile
+{
+    my ($data, $filename) = @_;
+
+    my ($ccCmd, $cxxCmd);
+    my $eids = $data->{eids};
+    foreach my $eid (@{$data->{buildEids}})  {
+	my $e = $eids->{$eid};
+	my $buildExecType = $e->{buildInfo}{buildExecType};
+	my $path = $e->{cmdPath};
+	if ($buildExecType eq 'gcc')  {
+	    if (!defined $ccCmd)  {
+		$ccCmd = $path;
+	    }  else  {
+		if ($ccCmd ne $path)  {
+		    print STDERR "Warning multiple path for CC; $path, $ccCmd\n";
+		}
+	    }
+	}  elsif ($buildExecType eq 'g++')  {
+	    if (!defined $cxxCmd)  {
+		$cxxCmd = $path;
+	    }  else  {
+		if ($cxxCmd ne $path)  {
+		    print STDERR "Warning multiple path for CXX; $path, $cxxCmd\n";
+		}
+	    }
+	}
+    }
+
+    open BUILDFILE, ">$filename" or die "open $filename: $!";
+
+    print BUILDFILE "#!/bin/bash\n\n";
+    print BUILDFILE "set -e\n";
+    print BUILDFILE "set -x\n";
+    print BUILDFILE "\nif [ -z \"\$CC\" ]; then\n    CC=\"$ccCmd\"\nfi\n" if defined $ccCmd;
+    print BUILDFILE "\nif [ -z \"\$CXX\" ]; then\n    CXX=\"$cxxCmd\"\nfi\n" if defined $cxxCmd;
+
+    my ($prevDir, $prevEnv) = ('', \%ENV);
+    foreach my $eid (@{$data->{buildEids}})  {
+	my $e = $eids->{$eid};
+	my $buildExecType = $e->{buildInfo}{buildExecType};
+	next unless $buildExecType eq 'gcc' || $buildExecType eq 'g++';
+
+	my $startCwd = $e->{startCwd};
+	next unless -d $startCwd;
+
+	my $atLeastOneFile = 0;
+	my @missingFiles = ();
+	my $bi = $e->{buildInfo};
+	next if $bi->{op} eq 'diagnostic';
+	foreach my $file (@{$bi->{files}})  {
+	    $atLeastOneFile = 1;
+	    my $type = $bi->{fileTypes}{$file};
+	    next if $type eq 'l' && $file =~ /^-l/;
+	    push @missingFiles, $file unless -f MakeAbsPath($startCwd, $file);
+	}
+	if (exists $bi->{T})  {
+	    my $file = $bi->{T};
+	    push @missingFiles, $file unless -f MakeAbsPath($startCwd, $file);
+	}
+
+	my ($s, $newDir, $newEnv)
+		= GetBashBuildCmds($e, $prevDir, $prevEnv, $ccCmd, $cxxCmd);
+
+	if (defined $s)  {
+	    my $errorMsg = '';
+	    if (!$atLeastOneFile)  {
+		$errorMsg = "# No input files to command, skipping:\n";
+	    }
+	    if (@missingFiles)  {
+		my $missingFiles = join(', ', @missingFiles);
+		$errorMsg = "# Files not found ($missingFiles), skipping:\n" ;
+	    }
+	    if ($errorMsg eq '')  {
+		($prevDir, $prevEnv) = ($newDir, $newEnv)
+	    }  else  {
+		$s =~ s/^/#  /mg;
+	    }
+	    print BUILDFILE "\n# eid=$eid\n$errorMsg$s"
+	}
+    }
+
+    close BUILDFILE or die "close $filename: $!";
+
+    chmod 0755, $filename or die "chmod 0755, $filename";
+
+    return ($ccCmd, $cxxCmd);
+}
+
+
+sub DoClangSaAssessment
+{
+    my ($data, $toolType, $resultsDir, $toolPath, $toolOpt, $toolConfFile, $toolDir) = @_;
+    my ($pass, $fail, $skip) = (0, 0);
+    my $uuid = GetUuid();
+    my $assessStartTs = GetCurTs();
+    my $savedCwd = getcwd();
+    my $buildRootDir = $data->{buildRootDir};
+    my $toolVersion = '';
+    my $id = 0;
+
+    my $clangPath = "$toolDir/bin/clang";
+    open TOOLVER, "$clangPath -v 2>&1 |" or die "open $clangPath -v |: $!";
+    while (<TOOLVER>)  {
+	$toolVersion .= $_;
+    }
+    close TOOLVER or die "close $toolPath --version|: $!";
+    chomp $toolVersion;
+
+    my $asFile = "$resultsDir/assessment_summary.xml";
+    open ASFILE, ">", $asFile or die "open $asFile: $!";
+    my $indent = 0;
+    my ($indent1, $indent2);
+    if (defined $indent)  {
+	$indent1 = $indent + 1;
+	$indent2 = $indent1 + 1;
+    }
+    print ASFILE XmlDecl('1.0', 'utf-8', $indent);
+    print ASFILE XmlOpenTag('assessment-summary', $indent);
+    print ASFILE XmlElem('assessment-summary-uuid', $uuid, $indent1);
+    print ASFILE XmlElem('build-summary-uuid', $data->{uuid}, $indent1);
+    print ASFILE XmlElem('build-root-dir', $buildRootDir, $indent1);
+    print ASFILE XmlElem('package-root-dir', $data->{packageRootDir}, $indent1);
+    print ASFILE XmlElem('platform-name', $data->{platName}, $indent1);
+    print ASFILE XmlElem('platform-uuid', $data->{platUuid}, $indent1);
+    print ASFILE XmlElem('package-name', $data->{pkgName}, $indent1);
+    print ASFILE XmlElem('package-version', $data->{pkgVersion}, $indent1);
+    print ASFILE XmlElem('tool-type', $toolType, $indent1);
+    print ASFILE XmlElem('tool-version', $toolVersion, $indent1);
+    print ASFILE XmlOpenTag('assessment-artifacts', $indent1);
+
+    chdir $buildRootDir;
+
+    ++$id;
+    my $outputDirName = "clang-sa_results$id";
+    my $stdoutFileName = "stdout$id.out";
+    my $stderrFileName = "stderr$id.out";
+    my $outputDir = "$resultsDir/$outputDirName";
+    my $stdoutPath = "$resultsDir/$stdoutFileName";
+    my $stderrPath = "$resultsDir/$stderrFileName";
+    my $buildFile = "$resultsDir/buildCmds$id.sh";
+
+    my ($ccCmd, $cxxCmd) = WriteBuildFile($data, $buildFile);
+    mkdir $outputDir, 0755 or die "mkdir $outputDir: $!";
+    my @cmd = ($toolPath,
+		'-o', $outputDir,
+		'-plist-html',
+		'--keep-empty',
+		'--use-analyzer', $clangPath);
+    push @cmd, '--use-cc', $ccCmd if defined $ccCmd;
+    push @cmd, '--use-c++', $cxxCmd if defined $cxxCmd;
+    push @cmd, $buildFile;
+
+    print STDERR "cd ", BashQuote($buildRootDir), " ; ", GetCmdString(\@cmd), "\n";
+
+    my $startTs = GetCurTs();
+    my ($exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus)
+	    = ExecCmd(\@cmd, undef, undef, $stdoutPath, $stderrPath);
+    my $stopTs = GetCurTs();
+    if ($exitStatus == 0)  {
+	++$pass;
+    }  else  {
+	++$fail;
+	print STDERR "# Error: ", GetExecErrorMsg(\@cmd, $exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus), "\n";
+    }
+
+    my $resultFileName;
+    opendir DIR, $outputDir or die "opendir $outputDir: $!";
+    while (my $dir = readdir DIR)  {
+	next if $dir =~ /^\.\.?$/;
+	die "ERROR in DoCLangSaAssessment: found multiple directories in clang output directory ($outputDir):"
+		. "  $resultFileName, $outputDirName/$dir" if defined $resultFileName;
+	$resultFileName = "$outputDirName/$dir";
+    }
+    closedir DIR or die "closedir $outputDir: $!";
+    die "ERROR in DoCLangSaAssessment: no directory found in clang output directory ($outputDir)"
+	    unless $pass == 0 || defined $resultFileName;
+
+    print ASFILE XmlAssessment($cmd[0], \@cmd, \%ENV, $buildRootDir,
+				$resultFileName, $stdoutFileName, $stderrFileName, $id,
+				$exitCode, $exitSignalName, $startTs, $stopTs, $indent2);
+
+    my $assessStopTs = GetCurTs();
+
+    chdir $savedCwd;
+
+    print ASFILE XmlCloseTag('assessment-artifacts', $indent1);
+    print ASFILE XmlElem('start-ts', $assessStartTs, $indent1);
+    print ASFILE XmlElem('stop-ts', $assessStopTs, $indent1);
+    print ASFILE XmlCloseTag('assessment-summary', $indent);
+    close ASFILE or die "close $asFile: $!";
+    return ($pass, $fail, $skip);
+}
+
+
+
+############################## GCC Warn #############################
+
+
+sub DoGccWarnAssessment
+{
+    my ($data, $toolType, $resultsDir, $toolPath, $toolOpt) = @_;
+    my ($pass, $fail, $skip) = (0, 0);
+    my $uuid = GetUuid();
+    my $id = 0;
+    my $savedCwd = getcwd();
+    my $assessStartTs = GetCurTs();
+    my $toolVersion;
+    my $gccPath = $toolPath;
+    my %warns;
+
+    for my $a (@{$data->{buildActions}})  {
+	my $op = $a->{op};
+	my $inFileType = $a->{inFiles}[0]{type};
+	next unless $op eq 'compile' && $inFileType =~ /^c(\+\+)?$/;
+
+	my $buildCmdOpts = GetBuildCommandOpts($data, $a);
+	
+	my $ver = $buildCmdOpts->{version};
+	if (defined $toolVersion)  {
+	    die "two gcc versions: $toolVersion, $ver" if $toolVersion ne $ver;
+	}  else  {
+	    $toolVersion = $ver;
+	}
+    }
+
+    my $asFile = "$resultsDir/assessment_summary.xml";
+    open ASFILE, ">", $asFile or die "open $asFile: $!";
+    my $indent = 0;
+    my ($indent1, $indent2);
+    if (defined $indent)  {
+	$indent1 = $indent + 1;
+	$indent2 = $indent1 + 1;
+    }
+    print ASFILE XmlDecl('1.0', 'utf-8', $indent);
+    print ASFILE XmlOpenTag('assessment-summary', $indent);
+    print ASFILE XmlElem('assessment-summary-uuid', $uuid, $indent1);
+    print ASFILE XmlElem('build-summary-uuid', $data->{uuid}, $indent1);
+    print ASFILE XmlElem('build-root-dir', $data->{buildRootDir}, $indent1);
+    print ASFILE XmlElem('package-root-dir', $data->{packageRootDir}, $indent1);
+    print ASFILE XmlElem('platform-name', $data->{platName}, $indent1);
+    print ASFILE XmlElem('platform-uuid', $data->{platUuid}, $indent1);
+    print ASFILE XmlElem('package-name', $data->{pkgName}, $indent1);
+    print ASFILE XmlElem('package-version', $data->{pkgVersion}, $indent1);
+    print ASFILE XmlElem('tool-type', $toolType, $indent1);
+    print ASFILE XmlElem('tool-version', $toolVersion, $indent1);
+    print ASFILE XmlOpenTag('assessment-artifacts', $indent1);
+
+    for my $a (@{$data->{buildActions}})  {
+	my $op = $a->{op};
+	my $eid = $a->{eid};
+	my $inFileType = $a->{inFiles}[0]{type};
+	my $inFilePath = $a->{inFiles}[0]{path};
+	next unless $a->{op} eq 'compile' && $inFileType =~ /^c(\+\+)?$/;
+
+	my $e = $data->{eids}{$eid};
+	my $bi = $e->{buildInfo};
+
+	my $env = $e->{startEnv};
+	my $cwd = $e->{startCwd};
+	my $buildCmdOpts = GetBuildCommandOpts($data, $a);
+	$gccPath = $e->{cmdPath} unless defined $toolPath;
+	unless (defined $warns{$gccPath}{$inFileType})  {
+	    $warns{$gccPath}{$inFileType} = GetGccValidWarnings($gccPath, $inFileType)
+	}
+	my $warnings = $warns{$gccPath}{$inFileType};
+	my @cmd = ($e->{cmdPath},
+		    @{$bi->{defines}},
+		    (map {"-I$_"} @{$bi->{includeSearch}}),
+		    (map {"--include=$_"} @{$bi->{include}}),
+		    "-x$inFileType",
+		    "-c",
+		    "-o", "/dev/null",
+		    "-O2",
+		    @{$bi->{dialect}},
+		    @$warnings,
+		    $inFilePath
+		    );
+
+	print STDERR "cd $cwd ; ", GetCmdString(\@cmd), "\n";
+	if (!-d $cwd)  {
+	    ++$skip;
+	    print STDERR "WARNING: directory '$cwd' does not exist, skipping\n";
+	    next;
+	}
+	chdir $cwd or die "chdir $cwd";
+	if (!-f $inFilePath)  {
+	    ++$skip;
+	    print STDERR "WARNING: source file '$inFilePath' does not exist, skipping\n";
+	    next;
+	}
+	my $outFile;
+	#my $outFile = '/dev/null';
+	++$id;
+	my $resultFileName = "assessment_report${id}.out";
+	my $resultFile = "$resultsDir/$resultFileName";
+	my $startTs = GetCurTs();
+	my ($exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus)
+		= ExecCmd(\@cmd, $env, undef, $outFile, $resultFile);
+	my $stopTs = GetCurTs();
+	if (defined $exitCode)  {
+	    ++$pass;
+	    print STDERR
+		    "# non-0 exit status ",
+		    GetExecErrorMsg(\@cmd, $exitCode, $exitSignal, $exitSignalName,
+			    $exitErrnoMsg, $exitStatus), "\n"
+		    unless $exitCode == 0;;
+	}  else  {
+	    ++$fail;
+	    print STDERR
+		    "# Error: ",
+		    GetExecErrorMsg(\@cmd, $exitCode, $exitSignal, $exitSignalName,
+			    $exitErrnoMsg, $exitStatus), "\n";
+	}
+	print ASFILE XmlAssessment($cmd[0], \@cmd, $env, $cwd, $resultFileName, undef, undef, $id,
+	    $exitCode, $exitSignalName, $startTs, $stopTs, $indent2);
+    }
+
+    chdir $savedCwd or die "chdir $savedCwd: $!";
+    my $assessStopTs = GetCurTs();
+
+    print ASFILE XmlCloseTag('assessment-artifacts', $indent1);
+    print ASFILE XmlElem('start-ts', $assessStartTs, $indent1);
+    print ASFILE XmlElem('stop-ts', $assessStopTs, $indent1);
+    print ASFILE XmlCloseTag('assessment-summary', $indent);
+    close ASFILE or die "close $asFile: $!";
+
+    return ($pass, $fail, $skip);
+}
+
+
+
+########################## Parasoft Ctest ###########################
+
+
+sub GetBashCpptestscanCmds
+{
+    my ($e, $prevDir, $prevEnv, $cpptestscanCmd) = @_;
+    my $buildExecType = $e->{buildInfo}{buildExecType};
+
+    if ($buildExecType eq 'gcc' || $buildExecType eq 'g++')  {
+	my $s = '';
+	my $dir = $e->{startCwd};
+	my $env = $e->{startEnv};
+	my $args = $e->{startArgs};
+
+	my ($added, $removed, $updated) = DiffEnv($prevEnv, $env);
+	foreach my $k (sort keys %$added)  {
+	    my $v = $added->{$k};
+	    $s .= BashSetEnvCmd($k, $v);
+	}
+	foreach my $k (sort keys %$updated)  {
+	    my $v = $updated->{$k};
+	    $s .= BashSetEnvCmd($k, $v);
+	}
+	foreach my $k (sort keys %$removed)  {
+	    $s .= BashUnsetEnvCmd($k);
+	}
+	$s .= "\n" unless $s eq '';
+
+	$s .= "cd " . BashQuote($dir) . "\n\n" unless $dir eq $prevDir;
+
+	$s .= "$cpptestscanCmd " . GetCmdString($args) . "\n";
+
+	return ($s, $dir, $env);
+    }  else  {
+	return (undef, $prevDir, $prevEnv);
+    }
+}
+
+
+sub WriteCpptestAssessCmdsFile
+{
+    my ($data, $filename, $cpptestscanCmdPath, $toolPath, $localsettingsFile, $bdfFile,
+		$projName, $testConfig, $jvmOpts, $workspaceDir, $reportDir, $resultsDir) = @_;
+
+    my ($ccCmd, $cxxCmd);
+    my $eids = $data->{eids};
+    foreach my $eid (@{$data->{buildEids}})  {
+	my $e = $eids->{$eid};
+	my $buildExecType = $e->{buildInfo}{buildExecType};
+	my $path = $e->{cmdPath};
+	if ($buildExecType eq 'gcc')  {
+	    if (!defined $ccCmd)  {
+		$ccCmd = $path;
+	    }  else  {
+		if ($ccCmd ne $path)  {
+		    print STDERR "Warning multiple path for CC; $path, $ccCmd\n";
+		}
+	    }
+	}  elsif ($buildExecType eq 'g++')  {
+	    if (!defined $cxxCmd)  {
+		$cxxCmd = $path;
+	    }  else  {
+		if ($cxxCmd ne $path)  {
+		    print STDERR "Warning multiple path for CXX; $path, $cxxCmd\n";
+		}
+	    }
+	}
+    }
+
+    my $cpptestscanFunc = "Cpptestscan";
+    my @cpptestscanCmd = (
+			    $cpptestscanCmdPath,
+			    "--cpptestscanOutputFile=$bdfFile",
+			    "--cpptestscanProjectName=$projName",
+			    "--cpptestscanRunOrigCmd=no"
+			);
+    my $cpptestscanCmd = GetCmdString(\@cpptestscanCmd);
+
+    open BUILDFILE, ">$filename" or die "open $filename: $!";
+
+    print BUILDFILE <<EOF;
+#!/bin/bash
+
+set -e
+set -x
+
+function $cpptestscanFunc()  {
+    $cpptestscanCmd "\$\@"
+}
+
+EOF
+
+    my ($prevDir, $prevEnv) = ('', \%ENV);
+    foreach my $eid (@{$data->{buildEids}})  {
+	my $e = $eids->{$eid};
+	my $buildExecType = $e->{buildInfo}{buildExecType};
+	next unless $buildExecType eq 'gcc' || $buildExecType eq 'g++';
+
+	my $startCwd = $e->{startCwd};
+	next unless -d $startCwd;
+
+	my $atLeastOneFile = 0;
+	my @missingFiles = ();
+	my $bi = $e->{buildInfo};
+	next if $bi->{op} eq 'diagnostic';
+	foreach my $file (@{$bi->{files}})  {
+	    $atLeastOneFile = 1;
+	    my $type = $bi->{fileTypes}{$file};
+	    next if $type eq 'l' && $file =~ /^-l/;
+	    push @missingFiles, $file unless -f MakeAbsPath($startCwd, $file);
+	}
+	if (exists $bi->{T})  {
+	    my $file = $bi->{T};
+	    push @missingFiles, $file unless -f MakeAbsPath($startCwd, $file);
+	}
+
+	my ($s, $newDir, $newEnv)
+		= GetBashCpptestscanCmds($e, $prevDir, $prevEnv, $cpptestscanFunc);
+
+	if (defined $s)  {
+	    my $errorMsg = '';
+	    if (!$atLeastOneFile)  {
+		$errorMsg = "# No input files to command, skipping:\n";
+	    }
+	    if (@missingFiles)  {
+		my $missingFiles = join(', ', @missingFiles);
+		$errorMsg = "# Files not found ($missingFiles), skipping:\n" ;
+	    }
+	    if ($errorMsg eq '')  {
+		($prevDir, $prevEnv) = ($newDir, $newEnv)
+	    }  else  {
+		$s =~ s/^/#  /mg;
+	    }
+	    print BUILDFILE "\n# eid=$eid\n$errorMsg$s"
+	}
+    }
+
+    my @cmd = ($toolPath,
+		'-data', $workspaceDir,
+		'-resource', $projName,
+		'-localsettings', $localsettingsFile,
+		'-config', $testConfig,
+		'-bdf', $bdfFile,
+		'-report', $reportDir,
+		'-showdetails');
+
+    if (HasValue $jvmOpts)  {
+	my @jvmOpts = split ' ', $jvmOpts;
+	push @cmd, @jvmOpts;
+    }
+    print BUILDFILE "\n\n\n# Assess using C/C++test\n";
+    print BUILDFILE "cd ", BashQuote($resultsDir), "\n\n";
+    print BUILDFILE GetCmdString(\@cmd), "\n";
+
+    close BUILDFILE or die "close $filename: $!";
+
+    chmod 0755, $filename or die "chmod 0755, $filename";
+
+    return ($ccCmd, $cxxCmd);
+}
+
+
+sub CheckParasoftLicenseFailure
+{
+    my ($exitCode, $stderrPath) = @_;
+
+    return 0 if $exitCode != 134;
+
+    my $linenum = 0;
+    my $licenseFailed = 0;
+    my $line;
+    open ERRFILE, "<", $stderrPath or die "open $stderrPath: $!";
+    while (<ERRFILE>)  {
+	++$linenum;
+	if (/Error:\s+No valid license/i)  {
+	    $licenseFailed = 1;
+	    $line = $_;
+	    chomp $line;
+	    last;
+	}
+    }
+    close ERRFILE or die "close $stderrPath: $!";
+
+    if ($licenseFailed)  {
+	print STDERR "Parasoft license acquire failed at $stderrPath line $linenum:\n\t$line\n";
+	$@ = LogStatus('assess-acquire-license', '', 1, undef, "$stderrPath:$linenum:  $line");
+    }
+
+    return $licenseFailed;
+}
+
+
+sub CheckParasoftCompatibility
+{
+    my ($exitCode, $stdoutPath) = @_;
+
+    return 0 if $exitCode != 130;
+
+    my $linenum = 0;
+    my $gccCompatibilityFailed = 0;
+    my $line;
+    my $usedCompiler;
+    my $availableCompilers;
+    open OUTFILE, "<", $stdoutPath or die "open $stdoutPath: $!";
+    while (<OUTFILE>)  {
+	++$linenum;
+	if (/failed - invalid project compiler family specified:\s+(\S+)/i)  {
+	    $gccCompatibilityFailed = 1;
+	    $line = $_;
+	    $usedCompiler = $1;
+	    chomp $line;
+	}
+	if (/Available compilers are:\s+(.*?)\s*$/)  {
+	    $availableCompilers = $1;
+	    last;
+	}
+    }
+    close OUTFILE or die "close $stdoutPath: $!";
+
+    if ($gccCompatibilityFailed)  {
+	print STDERR "Parasoft license acquire failed at $stdoutPath line $linenum:\n\t$line\n";
+	my $msg = "From $stdoutPath line $linenum\n    Used compiler $usedCompiler\n";
+	$msg .= "    Valid compilers: $availableCompilers" if defined $availableCompilers;
+	$@ = LogStatus('tool-package-compatibility', 'gcc version', 1, undef, $msg);
+    }
+
+    return $gccCompatibilityFailed;
+}
+
+
+sub DoParasoftCtestAssessment
+{
+    my ($data, $toolType, $resultsDir, $toolPath, $toolOpt, $toolConfFile, $toolDir, $servicesConfFile) = @_;
+    my ($pass, $fail, $skip) = (0, 0);
+    my $uuid = GetUuid();
+    my $assessStartTs = GetCurTs();
+    my $savedCwd = getcwd();
+    my $buildRootDir = $data->{buildRootDir};
+    my $toolVersion = '';
+    my $id = 0;
+
+    my $toolConf = ReadConfFile($toolConfFile);
+    my $projName = 'proj';
+    $projName = $toolConf->{'tool-ps-ctest-proj'} if HasValue $toolConf->{'tool-ps-ctest-proj'};
+    my $workspaceName = 'parasoft_workspace';
+    $workspaceName = $toolConf->{'tool-ps-ctest-workspace'} if HasValue $toolConf->{'tool-ps-ctest-workspace'};
+    my $testConfig = $toolConf->{'tool-ps-ctest-config'};
+    die "tool-ps-ctest-config not defined in $toolConf" unless HasValue $testConfig;
+    my $localsettingsFile = 'ps-ctest.properties';
+    $localsettingsFile = $toolConf->{'tool-ps-ctest-localsettings'} if HasValue $toolConf->{'tool-ps-ctest-localsettings'};
+    my $localsettingsPath = "$resultsDir/$localsettingsFile";
+    my $cpptestscanCmd = $toolConf->{'tool-ps-ctest-cpptestscan'};
+    die "tool-ps-ctest-cpptestscan not defined in $toolConf" unless HasValue $cpptestscanCmd;
+    my $cpptestscanCmdPath = "$toolDir/$cpptestscanCmd";
+    my $bdfFile = "$resultsDir/$projName.bdf";
+    my $reportDir = "$resultsDir/report";
+    my $projDir = "$resultsDir/$projName";
+    my $workspaceDir = "$resultsDir/$workspaceName";
+    my $jvmOpts = $toolConf->{'tool-ps-ctest-jvm-opts'};
+
+    die "--servicesconf file required, but option missing" unless defined $servicesConfFile;
+    my $servicesConf = ReadConfFile($servicesConfFile) if defined $servicesConfFile;
+    my $ctestLicenseHost = $servicesConf->{'tool-ps-ctest-license-host'};
+    my $ctestLicensePort = $servicesConf->{'tool-ps-ctest-license-port'};
+    die "tool-ps-ctest-license-host not defined in $servicesConfFile" unless HasValue $ctestLicenseHost;
+    die "tool-ps-ctest-license-port not defined in $servicesConfFile" unless HasValue $ctestLicensePort;
+
+    mkdir $reportDir or die "mkdir $reportDir: $!";
+    mkdir $projDir or die "mkdir $projDir: $!";
+
+    open TOOLVER, "$toolPath -version 2>&1 |" or die "open $toolPath -version |: $!";
+    while (<TOOLVER>)  {
+	$toolVersion .= $_;
+    }
+    close TOOLVER or die "close $toolPath --version|: $!";
+    chomp $toolVersion;
+
+    my $asFile = "$resultsDir/assessment_summary.xml";
+    open ASFILE, ">", $asFile or die "open $asFile: $!";
+    my $indent = 0;
+    my ($indent1, $indent2);
+    if (defined $indent)  {
+	$indent1 = $indent + 1;
+	$indent2 = $indent1 + 1;
+    }
+    print ASFILE XmlDecl('1.0', 'utf-8', $indent);
+    print ASFILE XmlOpenTag('assessment-summary', $indent);
+    print ASFILE XmlElem('assessment-summary-uuid', $uuid, $indent1);
+    print ASFILE XmlElem('build-summary-uuid', $data->{uuid}, $indent1);
+    print ASFILE XmlElem('build-root-dir', $buildRootDir, $indent1);
+    print ASFILE XmlElem('package-root-dir', $data->{packageRootDir}, $indent1);
+    print ASFILE XmlElem('platform-name', $data->{platName}, $indent1);
+    print ASFILE XmlElem('platform-uuid', $data->{platUuid}, $indent1);
+    print ASFILE XmlElem('package-name', $data->{pkgName}, $indent1);
+    print ASFILE XmlElem('package-version', $data->{pkgVersion}, $indent1);
+    print ASFILE XmlElem('tool-type', $toolType, $indent1);
+    print ASFILE XmlElem('tool-version', $toolVersion, $indent1);
+    print ASFILE XmlOpenTag('assessment-artifacts', $indent1);
+
+    chdir $buildRootDir or die "chdir $buildRootDir";
+
+    ++$id;
+    my $stdoutFileName = "stdout$id.out";
+    my $stderrFileName = "stderr$id.out";
+    my $stdoutPath = "$resultsDir/$stdoutFileName";
+    my $stderrPath = "$resultsDir/$stderrFileName";
+    my $assessCmdsFile = "$resultsDir/assessCmds$id.sh";
+
+    my ($ccCmd, $cxxCmd) = WriteCpptestAssessCmdsFile($data, $assessCmdsFile, $cpptestscanCmdPath,
+			$toolPath, $localsettingsFile, $bdfFile, $projName, $testConfig, $jvmOpts,
+			$workspaceDir, $reportDir, $resultsDir);
+    my $gccPath = $ccCmd;
+    $gccPath = $cxxCmd unless defined $ccCmd;
+    die "gcc command not found" unless defined $gccPath;
+
+    my $gccVersion = $data->{cmdInfo}{$gccPath}{version};
+    my $gccBits = $data->{cmdInfo}{$gccPath}{bits};
+    my $gccFamily;
+    if ($gccVersion =~ /^(\d+)\.(\d+)/)  {
+	$gccFamily = "gcc_${1}_${2}";
+	$gccFamily .= "-64" if $gccBits == 64;
+    }  else  {
+	die "Unknown gcc version format: $gccVersion";
+    }
+
+    open LOCALSETTINGS, ">", $localsettingsPath or die "open >$localsettingsFile: $!";
+    print LOCALSETTINGS <<EOF;
+bdf.import.location = $projDir
+bdf.import.compiler.family = $gccFamily
+cpptest.license.use_network = true
+cpptest.license.network.host = $ctestLicenseHost
+cpptest.license.network.port = $ctestLicensePort
+cpptest.license.network.edition = server_edition
+EOF
+    close LOCALSETTINGS or die "close $localsettingsPath: $!";
+
+    my @cmd = ($assessCmdsFile);
+
+    print STDERR GetCmdString(\@cmd), "\n";
+
+    my $startTs = GetCurTs();
+    my ($exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus)
+	    = ExecCmd(\@cmd, undef, undef, $stdoutPath, $stderrPath);
+    my $stopTs = GetCurTs();
+    if ($exitStatus == 0)  {
+	++$pass;
+    }  else  {
+	++$fail;
+	print STDERR "# Error: ", GetExecErrorMsg(\@cmd, $exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus), "\n";
+	CheckParasoftLicenseFailure($exitCode, $stderrPath);
+	CheckParasoftCompatibility($exitCode, $stdoutPath);
+    }
+
+    my $resultFileName = $reportDir;
+    $resultFileName =~ s/.*\///;
+    $resultFileName .= '/report.xml';
+
+    print ASFILE XmlAssessment($cmd[0], \@cmd, \%ENV, $buildRootDir,
+				$resultFileName, $stdoutFileName, $stderrFileName, $id,
+				$exitCode, $exitSignalName, $startTs, $stopTs, $indent2);
+
+    my $assessStopTs = GetCurTs();
+
+    chdir $savedCwd;
+
+    print ASFILE XmlCloseTag('assessment-artifacts', $indent1);
+    print ASFILE XmlElem('start-ts', $assessStartTs, $indent1);
+    print ASFILE XmlElem('stop-ts', $assessStopTs, $indent1);
+    print ASFILE XmlCloseTag('assessment-summary', $indent);
+    close ASFILE or die "close $asFile: $!";
+    return ($pass, $fail, $skip);
+}
+
+
+
+############################## HRL TIF ##############################
+
+
+sub GetBashHrlTifCmds
+{
+    my ($e, $prevDir, $prevEnv, $tifFunc) = @_;
+    my $buildExecType = $e->{buildInfo}{buildExecType};
+
+    my $s = '';
+    my $dir = $e->{startCwd};
+    my $env = $e->{startEnv};
+    my @args = @{$e->{startArgs}};
+    shift @args;
+
+    my ($added, $removed, $updated) = DiffEnv($prevEnv, $env);
+    foreach my $k (sort keys %$added)  {
+	my $v = $added->{$k};
+	$s .= BashSetEnvCmd($k, $v);
+    }
+    foreach my $k (sort keys %$updated)  {
+	my $v = $updated->{$k};
+	$s .= BashSetEnvCmd($k, $v);
+    }
+    foreach my $k (sort keys %$removed)  {
+	$s .= BashUnsetEnvCmd($k);
+    }
+    $s .= "\n" unless $s eq '';
+
+    $s .= "cd " . BashQuote($dir) . "\n\n" unless $dir eq $prevDir;
+
+    $s .= "$tifFunc " . GetCmdString(\@args) . "\n";
+
+    return ($s, $dir, $env);
+}
+
+
+sub WriteHrlTifAssessCmdsFile
+{
+    my ($data, $assessCmdsFile, $resultsFile, $tifCcCmd, $tifCxxCmd, $tifArCmd,
+		$policy, $pathPrefix, $ldLibraryPathPrefix) = @_;
+
+    my @tifOptions = (
+			    "-fsecchecker-logfile", $resultsFile,
+			    "-fsecchecker-policyfile", $policy,
+			    "-fsecchecker-no-terminate"
+			);
+    my %execTypeToTifFunc = (gcc => 'tifCC', 'g++' => 'tiffCxx', ar => 'tifAr');
+
+    my $tifOptions = GetCmdString(\@tifOptions);
+    my $setPath = "PATH=" . BashQuote($pathPrefix) . ':$PATH';
+    my $setLdLibraryPath = "LD_LIBRARY_PATH=" . BashQuote($ldLibraryPathPrefix) . ':$LD_LIBRARY_PATH';
+    my $setEnvs = "$setPath $setLdLibraryPath";
+    my $tifCc = "$setEnvs ". BashQuote($tifCcCmd) . " $tifOptions";
+    my $tifCxx = "$setEnvs ". BashQuote($tifCxxCmd) . " $tifOptions";
+    my $tifAr = "$setEnvs " . BashQuote($tifArCmd);
+
+    open BUILDFILE, ">$assessCmdsFile" or die "open $assessCmdsFile: $!";
+
+    print BUILDFILE <<EOF;
+#!/bin/bash
+
+set -e
+set -x
+
+function $execTypeToTifFunc{'gcc'}()  {
+    $tifCc "\$\@"
+}
+
+function $execTypeToTifFunc{'g++'}()  {
+    $tifCxx "\$\@"
+}
+
+function $execTypeToTifFunc{'ar'}()  {
+    set "\$\@"
+    rm -f "\$2"
+    $tifAr "\$\@"
+}
+
+EOF
+
+    my ($prevDir, $prevEnv) = ('', \%ENV);
+    my $eids = $data->{eids};
+    foreach my $eid (@{$data->{buildEids}})  {
+	my $e = $eids->{$eid};
+	my $buildExecType = $e->{buildInfo}{buildExecType};
+
+	my $startCwd = $e->{startCwd};
+	next unless -d $startCwd;
+
+	my $atLeastOneFile = 0;
+	my $linkOnly = 0;
+	my @missingFiles = ();
+	if ($buildExecType eq 'gcc' || $buildExecType eq 'g++')  {
+	    my $bi = $e->{buildInfo};
+	    next if $bi->{op} eq 'diagnostic';
+	    foreach my $file (@{$bi->{files}})  {
+		$atLeastOneFile = 1;
+		my $type = $bi->{fileTypes}{$file};
+		next if $type eq 'l' && $file =~ /^-l/;
+		push @missingFiles, $file unless -f MakeAbsPath($startCwd, $file);
+	    }
+	    if (exists $bi->{T})  {
+		my $file = $bi->{T};
+		push @missingFiles, $file unless -f MakeAbsPath($startCwd, $file);
+	    }
+	    if ($bi->{op} eq 'link')  {
+		$linkOnly = 1;
+	    }
+	}  else  {
+	    $atLeastOneFile = 1;
+	}
+
+	my $tifFunc = $execTypeToTifFunc{$buildExecType};
+	next unless defined $tifFunc;
+
+	my ($s, $newDir, $newEnv)
+		= GetBashHrlTifCmds($e, $prevDir, $prevEnv, $tifFunc);
+
+	if (defined $s)  {
+	    my $errorMsg = '';
+	    if (!$atLeastOneFile)  {
+		$errorMsg = "# No input files to command, skipping:\n";
+	    }
+	    if (@missingFiles)  {
+		my $missingFiles = join(', ', @missingFiles);
+		$errorMsg = "# Files not found ($missingFiles), skipping:\n" ;
+	    }
+	    if ($linkOnly)  {
+		$errorMsg = "# Link only, skipping:\n";
+	    }
+	    if ($errorMsg eq '')  {
+		($prevDir, $prevEnv) = ($newDir, $newEnv)
+	    }  else  {
+		$s =~ s/^/#  /mg;
+	    }
+	    print BUILDFILE "\n# eid=$eid\n$errorMsg$s"
+	}
+    }
+
+    close BUILDFILE or die "close $assessCmdsFile: $!";
+
+    chmod 0755, $assessCmdsFile or die "chmod 0755, $assessCmdsFile";
+}
+
+
+sub GetToolConfPath
+{
+    my ($toolConf, $toolDir, $k) = @_;
+
+    if (!defined $toolConf->{$k})  {
+	die "Required key '$k' not found in tool configuration file $toolConf"
+    }
+
+    my $p = "$toolDir/" . $toolConf->{$k};
+
+    return $p;
+}
+
+
+sub DoHrlTifAssessment
+{
+    my ($data, $toolType, $resultsDir, $toolPath, $toolOpt, $toolConfFile, $toolDir, $servicesConfFile) = @_;
+    my ($pass, $fail, $skip) = (0, 0);
+    my $uuid = GetUuid();
+    my $assessStartTs = GetCurTs();
+    my $savedCwd = getcwd();
+    my $buildRootDir = $data->{buildRootDir};
+    my $id = 0;
+
+    my $toolConf = ReadConfFile($toolConfFile);
+    my $tifCcCmd = GetToolConfPath($toolConf, $toolDir, 'tool-hrl-tif-cc');
+    my $tifCxxCmd = GetToolConfPath($toolConf, $toolDir, 'tool-hrl-tif-cxx');
+    my $tifArCmd = GetToolConfPath($toolConf, $toolDir, 'tool-hrl-tif-ar');
+    my $policy = GetToolConfPath($toolConf, $toolDir, 'tool-hrl-tif-policy');
+    my $pathPrefix = GetToolConfPath($toolConf, $toolDir, 'tool-hrl-tif-path-prefix');
+    my $ldLibraryPathPrefix = GetToolConfPath($toolConf, $toolDir,
+						'tool-hrl-tif-ld_library_path-prefix');
+    my $toolVersion = $toolConf->{'tool-version'};
+
+    my $asFile = "$resultsDir/assessment_summary.xml";
+    open ASFILE, ">", $asFile or die "open $asFile: $!";
+    my $indent = 0;
+    my ($indent1, $indent2);
+    if (defined $indent)  {
+	$indent1 = $indent + 1;
+	$indent2 = $indent1 + 1;
+    }
+    print ASFILE XmlDecl('1.0', 'utf-8', $indent);
+    print ASFILE XmlOpenTag('assessment-summary', $indent);
+    print ASFILE XmlElem('assessment-summary-uuid', $uuid, $indent1);
+    print ASFILE XmlElem('build-summary-uuid', $data->{uuid}, $indent1);
+    print ASFILE XmlElem('build-root-dir', $buildRootDir, $indent1);
+    print ASFILE XmlElem('package-root-dir', $data->{packageRootDir}, $indent1);
+    print ASFILE XmlElem('platform-name', $data->{platName}, $indent1);
+    print ASFILE XmlElem('platform-uuid', $data->{platUuid}, $indent1);
+    print ASFILE XmlElem('package-name', $data->{pkgName}, $indent1);
+    print ASFILE XmlElem('package-version', $data->{pkgVersion}, $indent1);
+    print ASFILE XmlElem('tool-type', $toolType, $indent1);
+    print ASFILE XmlElem('tool-version', $toolVersion, $indent1);
+    print ASFILE XmlOpenTag('assessment-artifacts', $indent1);
+
+    chdir $buildRootDir or die "chdir $buildRootDir";
+
+    ++$id;
+    my $stdoutFileName = "stdout$id.out";
+    my $stderrFileName = "stderr$id.out";
+    my $stdoutPath = "$resultsDir/$stdoutFileName";
+    my $stderrPath = "$resultsDir/$stderrFileName";
+    my $assessCmdsFile = "$resultsDir/assessCmds$id.sh";
+    my $resultsFileName = "results.txt";
+    my $resultsFile = "$resultsDir/$resultsFileName";
+
+    WriteHrlTifAssessCmdsFile($data, $assessCmdsFile, $resultsFile, $tifCcCmd, $tifCxxCmd,
+			$tifArCmd, $policy, $pathPrefix, $ldLibraryPathPrefix);
+
+    my @cmd = ($assessCmdsFile);
+
+    print STDERR GetCmdString(\@cmd), "\n";
+
+    my $startTs = GetCurTs();
+    my ($exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus)
+	    = ExecCmd(\@cmd, undef, undef, $stdoutPath, $stderrPath);
+    my $stopTs = GetCurTs();
+    if ($exitStatus == 0)  {
+	++$pass;
+    }  else  {
+	++$fail;
+	print STDERR "# Error: ", GetExecErrorMsg(\@cmd, $exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus), "\n";
+    }
+
+    print ASFILE XmlAssessment($cmd[0], \@cmd, \%ENV, $buildRootDir,
+				$resultsFileName, $stdoutFileName, $stderrFileName, $id,
+				$exitCode, $exitSignalName, $startTs, $stopTs, $indent2);
+
+    my $assessStopTs = GetCurTs();
+
+    chdir $savedCwd;
+
+    print ASFILE XmlCloseTag('assessment-artifacts', $indent1);
+    print ASFILE XmlElem('start-ts', $assessStartTs, $indent1);
+    print ASFILE XmlElem('stop-ts', $assessStopTs, $indent1);
+    print ASFILE XmlCloseTag('assessment-summary', $indent);
+    close ASFILE or die "close $asFile: $!";
+    return ($pass, $fail, $skip);
+}
+
+
+
+######################## GrammaTech CodeSonar #######################
+
+
+sub GetCsonarBashBuildCmds
+{
+    my ($e, $prevDir, $prevEnv, $specialEnvs) = @_;
+    my $buildExecType = $e->{buildInfo}{buildExecType};
+
+    if ($buildExecType eq 'gcc' || $buildExecType eq 'g++')  {
+	my $s = '';
+	my $dir = $e->{startCwd};
+	my $env = $e->{startEnv};
+	my @args = @{$e->{startArgs}};
+
+	my ($added, $removed, $updated) = DiffEnv($prevEnv, $env);
+	foreach my $k (sort keys %$added)  {
+	    my $v = $added->{$k};
+	    my $quotedK = BashQuote($k);
+	    if (exists $specialEnvs->{$k} && exists $specialEnvs->{$k}{set})  {
+		my $func = $specialEnvs->{$k}{set};
+		my $quotedV = BashQuote($v);
+		$s .= "$func $quotedK $quotedV\n";
+	    }  else  {
+		$s .= BashSetEnvCmd($k, $v);
+	    }
+	}
+	foreach my $k (sort keys %$updated)  {
+	    my $v = $updated->{$k};
+	    my $quotedK = BashQuote($k);
+	    if (exists $specialEnvs->{$k} && exists $specialEnvs->{$k}{set})  {
+		my $func = $specialEnvs->{$k}{set};
+		my $quotedV = BashQuote($v);
+		$s .= "$func $quotedK $quotedV\n";
+	    }  else  {
+		$s .= BashSetEnvCmd($k, $v);
+	    }
+	}
+	foreach my $k (sort keys %$removed)  {
+	    my $quotedK = BashQuote($k);
+	    if (exists $specialEnvs->{$k} && exists $specialEnvs->{$k}{unset})  {
+		my $func = $specialEnvs->{$k}{unset};
+		$s .= "$func $quotedK\n";
+	    }  else  {
+		$s .= BashUnsetEnvCmd($k);
+	    }
+	}
+	$s .= "\n" unless $s eq '';
+
+	$s .= "cd " . BashQuote($dir) . "\n\n" unless $dir eq $prevDir;
+
+	$s .= GetCmdString(\@args) . "\n";
+
+	return ($s, $dir, $env);
+    }  else  {
+	return (undef, $prevDir, $prevEnv);
+    }
+}
+
+
+sub GetAllEnvVarsUsed
+{
+    my ($h, $e) = @_;
+
+    my $envH = GetEnvHashFromArray($e);
+
+    foreach my $k (keys %$envH)  {
+	$h->{$k} = 1;
+    }
+
+    return;
+}
+
+
+sub GetUnusedName
+{
+    my ($h, $base) = @_;
+
+    return $base unless exists $h->{$base};
+
+    my $count = 1;
+    while (1)  {
+	my $name = "$base$count";
+	if (!exists $h->{$name})  {
+	    $h->{$name} = 1;
+	    return $name
+	}
+	++$count;
+	die "Can not find variable name not appearing as env name: $base" if $count > 10000;
+    }
+}
+
+
+sub TreatEnvSpecial
+{
+    my ($name, $ifs, $specialEnvs, $allVarsUsed) = @_;
+
+    my $assessExtrasName = GetUnusedName($allVarsUsed, "assessExtraValues__$name");
+    my $initFuncName = "Init__$name";
+    my $setFuncName = "Set__$name";
+    my $unsetFuncName = "Unset__$name";
+    my $pat = "[$ifs]";
+    my $buildValues = '';
+    if (exists $ENV{$name})  {
+	$buildValues = join ' ',
+			    map { BashQuote($_) }
+				split /$pat/, $ENV{$name}, -1;
+    }
+    my $code =<<EOF;
+#
+# Handle the environment variable $name specially,
+# always retain extra paths not present during the build.
+#
+
+function $initFuncName()  {
+    if [ -n "\$$name" ]; then
+	local -a buildValues=( $buildValues )
+	local savedIFS="\$IFS"
+	local -a extras
+	local found
+	IFS='$ifs'
+	for v in \$$name; do
+	    found=0
+	    for p in "\${buildValues[@]}"; do
+		if [ "\$v" == "\$p" ]; then
+		    found=1
+		    break
+		fi
+	    done
+	    if [ \$found == 0 ]; then
+		extras+=( "\$v" )
+	    fi
+	done
+	IFS=:
+	$assessExtrasName="\${extras[*]}"
+	IFS="\$savedIFS"
+    fi
+}
+
+$initFuncName
+
+function $setFuncName()  {
+    local cmd
+    local -a v=( "\$2" "\$$assessExtrasName" )
+    local savedIFS="\$IFS"
+    IFS=:
+    printf -v cmd "export %q=%q" "\$1" "\${v[*]}"
+    IFS="\$savedIFS"
+    eval "\$cmd"
+}
+
+function $unsetFuncName()  {
+    if [ -z "\$$assessExtrasName" ] && [ "\${$assessExtrasName-1}" == 1 ]; then
+	unset "\$1"
+    else
+	local cmd
+	printf -v cmd "export %q=%q" "\$1" "\$$assessExtrasName"
+	eval "\$cmd"
+    fi
+}
+
+
+EOF
+
+    $specialEnvs->{$name} = {
+			    set   => $setFuncName,
+			    unset => $unsetFuncName,
+			    code  => $code
+			};
+}
+
+
+sub WriteCsonarBuildFile
+{
+    my ($data, $filename) = @_;
+
+    my $eids = $data->{eids};
+
+    my %allVarsUsed;
+    foreach my $eid (@{$data->{buildEids}})  {
+	my $e = $eids->{$eid};
+	my $buildExecType = $e->{buildInfo}{buildExecType};
+	next unless $buildExecType eq 'gcc' || $buildExecType eq 'g++';
+	GetAllEnvVarsUsed(\%allVarsUsed, $e->{startEnv});
+    }
+
+    my $specialEnvs = {};
+    TreatEnvSpecial("LD_LIBRARY_PATH", ':', $specialEnvs, \%allVarsUsed)
+		if exists $allVarsUsed{LD_LIBRARY_PATH};
+    TreatEnvSpecial("LD_PRELOAD", ': ', $specialEnvs, \%allVarsUsed)
+		if exists $allVarsUsed{LD_PRELOAD};
+
+    open BUILDFILE, ">$filename" or die "open $filename: $!";
+
+    print BUILDFILE <<EOF;
+#!/bin/bash
+
+set -e
+set -x
+
+EOF
+
+    foreach my $v (keys %$specialEnvs)  {
+	print BUILDFILE $specialEnvs->{$v}{code}, "\n\n";
+    }
+
+    my ($prevDir, $prevEnv) = ('', \%ENV);
+    foreach my $eid (@{$data->{buildEids}})  {
+	my $e = $eids->{$eid};
+	my $buildExecType = $e->{buildInfo}{buildExecType};
+	next unless $buildExecType eq 'gcc' || $buildExecType eq 'g++';
+
+	my $startCwd = $e->{startCwd};
+	next unless -d $startCwd;
+
+	my $atLeastOneFile = 0;
+	my @missingFiles = ();
+	my $bi = $e->{buildInfo};
+	next if $bi->{op} eq 'diagnostic';
+	foreach my $file (@{$bi->{files}})  {
+	    $atLeastOneFile = 1;
+	    my $type = $bi->{fileTypes}{$file};
+	    next if $type eq 'l' && $file =~ /^-l/;
+	    push @missingFiles, $file unless -f MakeAbsPath($startCwd, $file);
+	}
+	if (exists $bi->{T})  {
+	    my $file = $bi->{T};
+	    push @missingFiles, $file unless -f MakeAbsPath($startCwd, $file);
+	}
+
+	my ($s, $newDir, $newEnv)
+		= GetCsonarBashBuildCmds($e, $prevDir, $prevEnv, $specialEnvs);
+
+	if (defined $s)  {
+	    my $errorMsg = '';
+	    if (!$atLeastOneFile)  {
+		$errorMsg = "# No input files to command, skipping:\n";
+	    }
+	    if (@missingFiles)  {
+		my $missingFiles = join(', ', @missingFiles);
+		$errorMsg = "# Files not found ($missingFiles), skipping:\n" ;
+	    }
+	    if ($errorMsg eq '')  {
+		($prevDir, $prevEnv) = ($newDir, $newEnv)
+	    }  else  {
+		$s =~ s/^/#  /mg;
+	    }
+	    print BUILDFILE "\n# eid=$eid\n$errorMsg$s"
+	}
+    }
+
+    close BUILDFILE or die "close $filename: $!";
+
+    chmod 0755, $filename or die "chmod 0755, $filename";
+
+    return;
+}
+
+
+sub GetUrlArray
+{
+    my ($elem, $attr, $s) = @_;
+    my @a;
+
+    while ($s =~ /\<$elem\b(.*?)\>/sg)  {
+	my $e = $1;
+	while ($e =~ /\s*([-[:alnum:]_.:]+)=(['"])(.*?)\2|\s*$|(.*)$/sg)  {
+	    die "GetUrlArray: bad entity attributes: '$4'" if defined $4;
+	    next unless defined $1;
+	    my ($name, $value) = ($1, $3);
+	    if ($name eq $attr)  {
+		push @a, XmlUnescape($value);
+	    }
+	}
+    }
+
+    return \@a;
+}
+
+
+sub FetchAndGetUrlArray
+{
+    my ($url, $file, $elem, $attr) = @_;
+    my @cmd = ('wget', '--no-verbose', '-O', $file, $url);
+
+    print GetCmdString(\@cmd), "\n";	#jk
+    ExecCmdAndFail(\@cmd);
+
+    return unless defined $elem;
+
+    my $s = ReadFile $file;
+    my $urls = GetUrlArray $elem, $attr, $s;
+
+    return $urls;
+}
+
+
+sub GetCodeSonarWarnings
+{
+    my ($url, $outputDir) = @_;
+
+    if (!-d $outputDir)  {
+	print STDERR "mkdir $outputDir\n";
+	mkdir $outputDir, 0755 or die "mkdir $outputDir: $!";
+    }
+    print STDERR "cd $outputDir\n";
+    chdir $outputDir or die "cd $outputDir: $!";
+
+    my $urls = FetchAndGetUrlArray "$url/index.xml", "index.xml", 'project', 'url';
+
+    my $analysisUrl = $urls->[0];
+    my $analysisFile = $analysisUrl;
+    my $metricUrl = $analysisUrl;
+    $analysisUrl = "$url$analysisUrl";
+    $analysisFile =~ s/^.*\/([^?]*?)(\?.*)?$/analysis_$1/;
+    $metricUrl =~ s/^\/analysis/\/metrics/;
+    my $metricFile = $analysisFile;
+    $metricUrl = "$url$metricUrl";
+    $metricFile =~ s/^analysis/metrics/;
+
+    FetchAndGetUrlArray $metricUrl, $metricFile;
+
+    $urls = FetchAndGetUrlArray $analysisUrl, $analysisFile, 'warning', 'url';
+    my $lastD = '.';
+    foreach my $u (@$urls)  {
+	my $f = $u;
+	$f =~ s/^\/?(.*?)\?.*/$1/;
+	my $d = $f;
+	$d =~ s/\/.*?$//;
+	$d = '.' if $d eq '';
+	if ($d ne $lastD && !-d $d)  {
+	    print STDERR "mkdir $d\n";
+	    mkdir $d, 0755 or die "mkdir $d: $!";
+	}
+	$lastD = $d;
+	$u = "$url$u";
+	FetchAndGetUrlArray $u, $f;
+    }
+
+    return $analysisFile;
+}
+
+
+sub GetHubInfo
+{
+    my ($toolPath, $csonarHubHostPort, $resultsDir) = @_;
+
+    my @cmd = ( $toolPath, 'hub-info', $csonarHubHostPort );
+    print STDERR GetCmdString(\@cmd), "\n\n";
+    my $stdoutPath = "$resultsDir/hub_info_stdout.out";
+    my $stderrPath = "$resultsDir/hub_info_stderr.out";
+    my ($exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus)
+		= ExecCmd(\@cmd, undef, undef, $stdoutPath, $stderrPath);
+
+    my %data;
+    my $lineNum = 0;
+    my $colonColumn;
+    my $group;
+    my $k;
+
+    $data{cmd}{exitCode} = $exitCode if defined $exitCode;
+    $data{cmd}{exitSignal} = $exitSignal if defined $exitSignal;
+    $data{cmd}{exitSignalName} = $exitSignalName if defined $exitSignalName;
+    $data{cmd}{exitErrnoMsg} = $exitErrnoMsg if defined $exitErrnoMsg;
+    $data{cmd}{exitStatus} = $exitStatus if defined $exitStatus;
+    if ($exitStatus != 0)  {
+	$data{cmd}{errMsg} = GetExecErrorMsg(\@cmd, $exitCode, $exitSignal, $exitSignalName,
+				    $exitErrnoMsg, $exitStatus);
+    }
+
+    if ($exitStatus == 0)  {
+	open INFO, "<", $stdoutPath or die "open $stdoutPath: $!";
+	while (<INFO>)  {
+	    my ($newK, $v);
+	    chomp;
+	    ++$lineNum;
+	    next if /^\s*$/ && !defined $k;
+	    if (/^\s*={10,}\s+(.*?)\s+={10,}\s*$/)  {
+		$group = $1;
+		undef $colonColumn;
+		undef $k;
+		next;
+	    }
+	    if (/^(\s*)(.*?):\s+(.*?)\s*$/)  {
+		if (!defined $k && $1 ne '')  {
+		    $colonColumn = length($1) + length($2);
+		}
+		($newK, $v) = ($2, $3);
+		if (defined $colonColumn)  {
+		    if (substr($_, $colonColumn, 1) ne ':' || $_ =~ /^\s*"/)  {
+			($newK, $v) = ($k, $_);
+		    }
+		}
+	    }  elsif (defined $k)  {
+		($newK, $v) = ($k, $_)
+	    }  else  {
+		die "Error parsing CodeSonar hub-info file $stdoutPath:$lineNum no colon found: $_";
+	    }
+
+	    if (exists $data{$group}{$newK})  {
+		$data{$group}{$newK} .= "\n$v";
+	    }  else  {
+		$data{$group}{$newK} = $v;
+	    }
+
+	    if (defined $k && $newK ne $k)  {
+		$data{$group}{$k} =~ s/\s*$//;
+	    }
+
+	    $k = $newK;
+	}
+	close INFO, or die "close $stdoutPath: $!";
+
+	if (defined $group && defined $k)  {
+	    $data{$group}{$k} =~ s/\s*$//;
+	}
+    }  else  {
+	$data{cmd}{stdout} = ReadFile($stdoutPath);
+	$data{cmd}{stderr} = ReadFile($stderrPath);
+	chomp $data{cmd}{stdout};
+	chomp $data{cmd}{stderr};
+	$data{cmd}{line1} = $data{cmd}{stderr} =~ /^(.*)/;
+    }
+    
+
+    return \%data;
+}
+
+
+sub DoCodeSonarAssessment
+{
+    my ($data, $toolType, $resultsDir, $toolPath, $toolOpt, $toolConfFile, $toolDir,
+	    $servicesConfFile, $toolsBaseDir) = @_;
+
+    my ($pass, $fail, $skip) = (0, 0);
+    my $uuid = GetUuid();
+    my $assessStartTs = GetCurTs();
+    my $savedCwd = getcwd();
+    my $buildRootDir = $data->{buildRootDir};
+    my $id = 0;
+
+    my @toolRequiredOpts = qw( tool-codesonar-proj tool-codesonar-hub-dir tool-codesonar-hub-host
+				tool-codesonar-hub-port tool-codesonar-hub-license
+				tool-codesonar-hub-pw-env tool-codesonar-hub-pw
+			    );
+    my $toolConf = ReadConfFile($toolConfFile, \@toolRequiredOpts);
+    my $toolVersion = $toolConf->{'tool-version'};
+    my $csonarProj = "$toolsBaseDir/" . $toolConf->{'tool-codesonar-proj'};
+    my $csonarHubDir = "$toolsBaseDir/" . $toolConf->{'tool-codesonar-hub-dir'};
+    my $csonarHubHost = $toolConf->{'tool-codesonar-hub-host'};
+    my $csonarHubPort = $toolConf->{'tool-codesonar-hub-port'};
+    my $csonarHubHostPort = "$csonarHubHost:$csonarHubPort";
+    my $csonarHubLicense = "$toolDir/" . $toolConf->{'tool-codesonar-hub-license'};
+    my $csonarHubLicenseFile = $toolConf->{'tool-codesonar-hub-license-file'};
+    my $csonarHubPwEnv = $toolConf->{'tool-codesonar-hub-pw-env'};
+    my $csonarHubPw = $toolConf->{'tool-codesonar-hub-pw'};
+
+    if (HasValue $csonarHubLicenseFile)  {
+	use File::Copy;
+	my $l = $toolConfFile;
+	$l =~ s/[^\/]*$/$csonarHubLicenseFile/;
+	print STDERR "cp $l $csonarHubLicense\n";
+	copy($l, $csonarHubLicense) or die "cp $l $csonarHubLicense: $!";
+    }  else  {
+	die "--servicesconf option required, but option missing" unless defined $servicesConfFile;
+	my @servicesRequiredOpts = qw( tool-gt-csonar-license-host tool-gt-csonar-license-port );
+	my $servicesConf = ReadConfFile($servicesConfFile, \@servicesRequiredOpts);
+	my $licenseHost = $servicesConf->{'tool-gt-csonar-license-host'};
+	my $licensePort = $servicesConf->{'tool-gt-csonar-license-port'};
+	WriteFile($csonarHubLicense, <<EOF);
+{ "server address":"$licenseHost:$licensePort",
+  "server side" : true  }
+EOF
+    }
+
+
+    # initialize license
+    my @cmd = ( $toolPath, 'activate' );
+    my $cmd = "yes | " . GetCmdString(\@cmd);
+    print STDERR "$cmd\n\n";
+    my $activateStdoutPath = "$resultsDir/hub_activate_stdout.out";
+    my $activateStderrPath = "$resultsDir/hub_activate_stderr.out";
+    ExecCmdAndFail($cmd, undef, undef, $activateStdoutPath, $activateStderrPath);
+
+
+    # start hub
+    @cmd = ( $toolPath, 'hub-start', $csonarHubDir, $csonarHubHostPort );
+    print STDERR GetCmdString(\@cmd), "\n\n";
+    my $startStdoutPath = "$resultsDir/hub_start_stdout.out";
+    my $startStderrPath = "$resultsDir/hub_start_stderr.out";
+    my %hubStartEnv = %ENV;
+    $hubStartEnv{$csonarHubPwEnv} = $csonarHubPw;
+    ExecCmdAndFail(\@cmd, \%hubStartEnv, undef, $startStdoutPath, $startStderrPath);
+
+
+    # check hub status
+    my $hubInfo = GetHubInfo($toolPath, $csonarHubHostPort, $resultsDir);
+    if ($hubInfo->{cmd}{exitStatus} != 0)  {
+	my $msg = $hubInfo->{cmd}{errMsg} . "\n\n" . $hubInfo->{cmd}{Line1};
+	$@ = LogStatus('assess-acquire-license', '', 1, undef, $msg);
+	die $@;
+    }  elsif ($hubInfo->{License}{Licensed} !~ /^True$/i)  {
+	my $msg = $hubInfo->{License}{'License Error'};
+	$@ = LogStatus('assess-acquire-license', '', 1, undef, $msg);
+	die $@;
+    }
+    $toolVersion = $hubInfo->{Process}{Version} if defined $hubInfo->{Process}{Version};
+    
+
+    # run assessment
+    my $asFile = "$resultsDir/assessment_summary.xml";
+    open ASFILE, ">", $asFile or die "open $asFile: $!";
+    my $indent = 0;
+    my ($indent1, $indent2);
+    if (defined $indent)  {
+	$indent1 = $indent + 1;
+	$indent2 = $indent1 + 1;
+    }
+    print ASFILE XmlDecl('1.0', 'utf-8', $indent);
+    print ASFILE XmlOpenTag('assessment-summary', $indent);
+    print ASFILE XmlElem('assessment-summary-uuid', $uuid, $indent1);
+    print ASFILE XmlElem('build-summary-uuid', $data->{uuid}, $indent1);
+    print ASFILE XmlElem('build-root-dir', $buildRootDir, $indent1);
+    print ASFILE XmlElem('package-root-dir', $data->{packageRootDir}, $indent1);
+    print ASFILE XmlElem('platform-name', $data->{platName}, $indent1);
+    print ASFILE XmlElem('platform-uuid', $data->{platUuid}, $indent1);
+    print ASFILE XmlElem('package-name', $data->{pkgName}, $indent1);
+    print ASFILE XmlElem('package-version', $data->{pkgVersion}, $indent1);
+    print ASFILE XmlElem('tool-type', $toolType, $indent1);
+    print ASFILE XmlElem('tool-version', $toolVersion, $indent1);
+    print ASFILE XmlOpenTag('assessment-artifacts', $indent1);
+
+    chdir $buildRootDir or die "chdir $buildRootDir";
+
+    ++$id;
+    my $stdoutFileName = "stdout$id.out";
+    my $stderrFileName = "stderr$id.out";
+    my $stdoutPath = "$resultsDir/$stdoutFileName";
+    my $stderrPath = "$resultsDir/$stderrFileName";
+    my $assessCmdsFile = "$resultsDir/assessCmds$id.sh";
+
+    WriteCsonarBuildFile($data, $assessCmdsFile);
+
+    my %compilers;
+    my $cmdInfo = $data->{cmdInfo};
+    foreach my $path (keys %$cmdInfo)  {
+	$path =~ s/^.*\///;
+	if ($path =~ /(g(cc|\+\+))/)  {
+	    my $type = $1;
+	    $type = 'gpp' if $type eq 'g++';
+	    next if $path =~ /^g(cc|\+\+)$/;
+	    $compilers{$path} = $type;
+	}
+    }
+    if (%compilers)  {
+	@cmd = ($toolPath, 'create-conf', $csonarProj);
+	print STDERR GetCmdString(\@cmd), "\n\n";
+	ExecCmdAndFail(\@cmd, undef, undef, $stdoutPath, $stderrPath);
+
+	my $confFile = "$csonarProj.conf";
+	die "$confFile from create-conf does not exist" unless -f $confFile;
+
+	open CONF, ">>", $confFile or die "open $confFile: $!";
+	print CONF "\n\n";
+	foreach my $p (keys %compilers)  {
+	    my $type = $compilers{$p};
+	    my $compilerModel = "COMPILER_MODELS += $p -> $type\n";
+	    print CONF $compilerModel;
+	    print STDERR "Appending to $confFile: $compilerModel";
+	}
+	close CONF or die "close $confFile: $!";
+    }
+
+    @cmd = ($toolPath,
+		'analyze',
+		$csonarProj,
+		'-foreground',
+		$csonarHubHostPort,
+		$assessCmdsFile);
+
+    print STDERR "cd ", BashQuote($buildRootDir), " ; ", GetCmdString(\@cmd), "\n";
+
+    my $startTs = GetCurTs();
+    my ($exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus)
+	    = ExecCmd(\@cmd, undef, undef, $stdoutPath, $stderrPath);
+    my $stopTs = GetCurTs();
+    if ($exitStatus == 0)  {
+	++$pass;
+    }  else  {
+	++$fail;
+	print STDERR "# Error: ", GetExecErrorMsg(\@cmd, $exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus), "\n";
+    }
+
+
+    # fetch results
+    my $resultsDirName = "results$id";
+    my $resultsDirPath = "$resultsDir/$resultsDirName";
+    my $analysisFile = GetCodeSonarWarnings "http://$csonarHubHostPort", $resultsDirPath;
+    my $analysisFilePath = "$resultsDirName/$analysisFile";
+
+    print ASFILE XmlAssessment($cmd[0], \@cmd, \%ENV, $buildRootDir,
+				$analysisFilePath, $stdoutFileName, $stderrFileName, $id,
+				$exitCode, $exitSignalName, $startTs, $stopTs, $indent2);
+
+
+    # stop hub
+    @cmd = ( $toolPath, 'hub-stop', $csonarHubHostPort );
+    print STDERR GetCmdString(\@cmd), "\n\n";
+    my $stopStdoutPath = "$resultsDir/hub_stop_stdout.out";
+    my $stopStderrPath = "$resultsDir/hub_stop_stderr.out";
+    ExecCmdAndFail(\@cmd, undef, undef, $stopStdoutPath, $stopStderrPath);
+
+    my $assessStopTs = GetCurTs();
+
+    chdir $savedCwd;
+
+    print ASFILE XmlCloseTag('assessment-artifacts', $indent1);
+    print ASFILE XmlElem('start-ts', $assessStartTs, $indent1);
+    print ASFILE XmlElem('stop-ts', $assessStopTs, $indent1);
+    print ASFILE XmlCloseTag('assessment-summary', $indent);
+    close ASFILE or die "close $asFile: $!";
+
+    return ($pass, $fail, $skip);
+}
+
+
+
+############################# RedLizard Goanna #############################
+
+
+sub GetHomeDir
+{
+    my $d = $ENV{HOME};
+
+    if (!defined $d)  {
+	my @g = glob '~';
+	die "'glob ~' returned not just one value: @g" unless @g == 1;
+	$d = $g[0];
+    }
+
+    die "home directory, '$d', does not exist" unless -d $d;
+
+    return $d;
+}
+
+
+sub GetConfValue
+{
+    my ($h, $k) = @_;
+
+    my $v = $h->{$k};
+    $v = '' unless defined $v;
+    return $v;
+}
+
+
+sub CheckGoannaLicenseFailure
+{
+    my ($stderrPath) = @_;
+
+    open ERRFILE, '<', $stderrPath or die "open $stderrPath: $!";
+    my $lineNum = 0;
+    while (<ERRFILE>)  {
+	if (/license/i)  {
+	    chomp;
+	    print STDERR "Red Lizard Goanna license acquire failed at $stderrPath line $lineNum:\n\t$_\n";
+	    LogStatus('assess-acquire-license', '', 1, undef, "$stderrPath:$lineNum:  $_");
+	    last;
+	}
+    }
+    close ERRFILE or die "close $stderrPath: $!";
+}
+
+
+sub DoGoannaAssessment
+{
+    my ($data, $toolType, $resultsDir, $toolPath, $toolOpt, $toolConfFile, $toolDir,
+	    $servicesConfFile, $toolsBaseDir) = @_;
+
+    my ($pass, $fail, $skip) = (0, 0);
+    my $uuid = GetUuid();
+    my $assessStartTs = GetCurTs();
+    my $savedCwd = getcwd();
+    my $buildRootDir = $data->{buildRootDir};
+    my $id = 0;
+
+    my @toolRequiredOpts = qw( tool-goanna-dir tool-goanna-std-pkgs tool-goanna-extra-pkgs
+				tool-goanna-analyze-opts tool-goanna-output-file );
+    my $toolConf = ReadConfFile($toolConfFile, \@toolRequiredOpts);
+    my $toolVersion = $toolConf->{'tool-version'};
+    my $goannaDirName = $toolConf->{'tool-goanna-dir'};
+    my $goannaDir = "$resultsDir/$goannaDirName";
+    my $goannaOutputFile = "$goannaDirName/" . $toolConf->{'tool-goanna-output-file'};
+    my @goannaStdPkgs = split ' ', GetConfValue($toolConf, 'tool-goanna-std-pkgs');
+    my @goannaExtraPkgs = split ' ', GetConfValue($toolConf, 'tool-goanna-extra-pkgs');
+    my @goannaAnalyzeOpts = split ' ', GetConfValue($toolConf, 'tool-goanna-analyze-opts');
+    my @goannaTraceOpts = split ' ', GetConfValue($toolConf, 'tool-goanna-trace-opts');
+    my @goannaReportOpts = split ' ', GetConfValue($toolConf, 'tool-goanna-report-opts');
+    my $goannaLicense;
+    my $goannaLicenseFile = $toolConf->{'tool-goanna-license-file'};
+    my $goannaBin = "$toolDir/bin";
+    my @commonOpts = ( "--goanna-dir=$goannaDir" );
+    my @licenseOpts;
+
+    if (HasValue $goannaLicenseFile)  {
+	use File::Copy;
+	$goannaLicense = "$toolDir/" . $toolConf->{'tool-goanna-license'};
+	my $l = $toolConfFile;
+	$l =~ s/[^\/]*$/$goannaLicenseFile/;
+	my $homeDir = GetHomeDir;
+	my $licDstPath = "$homeDir/$goannaLicense";
+
+	print STDERR "cp $l $licDstPath\n";
+	copy($l, $licDstPath) or die "cp $l $licDstPath: $!";
+    }  else  {
+	die "--servicesconf option required, but option missing" unless defined $servicesConfFile;
+	my @servicesRequiredOpts = qw( tool-rl-goanna-license-host tool-rl-goanna-license-port );
+	my $servicesConf = ReadConfFile($servicesConfFile, \@servicesRequiredOpts);
+	my $licenseHost = $servicesConf->{'tool-rl-goanna-license-host'};
+	my $licensePort = $servicesConf->{'tool-rl-goanna-license-port'};
+	push @licenseOpts, "--license-server=$licenseHost:$licensePort";
+    }
+
+    chdir $buildRootDir or die "chdir $buildRootDir";
+    print STDERR "cd ", BashQuote($buildRootDir), "\n\n";
+
+
+    # initialize goanna
+    my @cmd = ( "$goannaBin/goanna-init", @commonOpts );
+    print STDERR GetCmdString(\@cmd) . "\n\n";
+    my $stdoutPath = "$resultsDir/goanna_init_stdout.out";
+    my $stderrPath = "$resultsDir/goanna_init_stderr.out";
+    ExecCmdAndFail(\@cmd, undef, undef, $stdoutPath, $stderrPath);
+
+    # enable extra packages (checks)
+    my $goannaPackage = "$goannaBin/goanna-package";
+    foreach my $pkg (@goannaExtraPkgs)  {
+	@cmd = ( $goannaPackage, @commonOpts, 'enable-pkg', $pkg);
+	print STDERR GetCmdString(\@cmd), "\n\n";
+	$stdoutPath = "$resultsDir/goanna_package_enable_pkg_${pkg}_stdout.out";
+	$stderrPath = "$resultsDir/goanna_package_enable_pkg_${pkg}_stderr.out";
+	ExecCmdAndFail(\@cmd, undef, undef, $stdoutPath, $stderrPath);
+    }
+
+    # get the status of configured packages (checks)
+    @cmd = ( $goannaPackage, @commonOpts, 'list' );
+    print STDERR GetCmdString(\@cmd), "\n\n";
+    $stdoutPath = "$resultsDir/goanna_package_list_stdout.out";
+    $stderrPath = "$resultsDir/goanna_package_list_stderr.out";
+    ExecCmdAndFail(\@cmd, undef, undef, $stdoutPath, $stderrPath);
+
+    foreach my $pkg (@goannaStdPkgs, @goannaExtraPkgs)  {
+	@cmd = ( $goannaPackage, @commonOpts, 'checks', $pkg);
+	print STDERR GetCmdString(\@cmd), "\n\n";
+	$stdoutPath = "$resultsDir/goanna_package_checks_${pkg}_stdout.out";
+	$stderrPath = "$resultsDir/goanna_package_checks_${pkg}_stderr.out";
+	ExecCmdAndFail(\@cmd, undef, undef, $stdoutPath, $stderrPath);
+    }
+
+    # run assessment
+    my $asFile = "$resultsDir/assessment_summary.xml";
+    open ASFILE, ">", $asFile or die "open $asFile: $!";
+    my $indent = 0;
+    my ($indent1, $indent2);
+    if (defined $indent)  {
+	$indent1 = $indent + 1;
+	$indent2 = $indent1 + 1;
+    }
+    print ASFILE XmlDecl('1.0', 'utf-8', $indent);
+    print ASFILE XmlOpenTag('assessment-summary', $indent);
+    print ASFILE XmlElem('assessment-summary-uuid', $uuid, $indent1);
+    print ASFILE XmlElem('build-summary-uuid', $data->{uuid}, $indent1);
+    print ASFILE XmlElem('build-root-dir', $buildRootDir, $indent1);
+    print ASFILE XmlElem('package-root-dir', $data->{packageRootDir}, $indent1);
+    print ASFILE XmlElem('platform-name', $data->{platName}, $indent1);
+    print ASFILE XmlElem('platform-uuid', $data->{platUuid}, $indent1);
+    print ASFILE XmlElem('package-name', $data->{pkgName}, $indent1);
+    print ASFILE XmlElem('package-version', $data->{pkgVersion}, $indent1);
+    print ASFILE XmlElem('tool-type', $toolType, $indent1);
+    print ASFILE XmlElem('tool-version', $toolVersion, $indent1);
+    print ASFILE XmlOpenTag('assessment-artifacts', $indent1);
+
+    ++$id;
+    my $stdoutFileName = "goanna_trace_stdout$id.out";
+    my $stderrFileName = "goanna_trace_stderr$id.out";
+    $stdoutPath = "$resultsDir/$stdoutFileName";
+    $stderrPath = "$resultsDir/$stderrFileName";
+    my $assessCmdsFile = "$resultsDir/assessCmds$id.sh";
+
+    WriteCsonarBuildFile($data, $assessCmdsFile);
+
+    @cmd = ("$goannaBin/goanna-trace",
+		@commonOpts,
+		@licenseOpts,
+		@goannaTraceOpts,
+		'--', $assessCmdsFile);
+
+    print GetCmdString(\@cmd), "\n\n";
+
+    my $startTs = GetCurTs();
+    my ($exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus)
+	    = ExecCmd(\@cmd, undef, undef, $stdoutPath, $stderrPath);
+    my $stopTs = GetCurTs();
+    if ($exitStatus == 0)  {
+	my $stdoutFileName = "goanna_analyze_stdout$id.out";
+	my $stderrFileName = "goanna_analyze_stderr$id.out";
+	$stdoutPath = "$resultsDir/$stdoutFileName";
+	$stderrPath = "$resultsDir/$stderrFileName";
+	@cmd = ("$goannaBin/goanna-analyze",
+		    @commonOpts,
+		    @licenseOpts,
+		    @goannaAnalyzeOpts);
+
+	print GetCmdString(\@cmd), "\n\n";
+
+	my $stopTs = GetCurTs();
+	my ($exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus)
+		= ExecCmd(\@cmd, undef, undef, $stdoutPath, $stderrPath);
+
+    }
+
+    if ($exitStatus == 0)  {
+	++$pass;
+    }  else  {
+	++$fail;
+	CheckGoannaLicenseFailure($stderrPath);
+	print STDERR "# Error: ", GetExecErrorMsg(\@cmd, $exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus), "\n";
+    }
+
+    print ASFILE XmlAssessment($cmd[0], \@cmd, \%ENV, $buildRootDir,
+				$goannaOutputFile, $stdoutFileName, $stderrFileName, $id,
+				$exitCode, $exitSignalName, $startTs, $stopTs, $indent2);
+
+    if ($exitStatus == 0)  {
+	# produce Goanna report
+	@cmd = ( "$goannaBin/goanna-report", @commonOpts, @goannaReportOpts );
+	print STDERR GetCmdString(\@cmd), "\n\n";
+	$stdoutPath = "$resultsDir/goanna_report_stdout.out";
+	$stderrPath = "$resultsDir/goanna_report_stderr.out";
+	ExecCmdAndFail(\@cmd, undef, undef, $stdoutPath, $stderrPath);
+    }
+
+    my $assessStopTs = GetCurTs();
+
+    chdir $savedCwd or die "chdir $savedCwd: $!";
+    print STDERR "cd ", BashQuote($savedCwd), "\n";
+
+    print ASFILE XmlCloseTag('assessment-artifacts', $indent1);
+    print ASFILE XmlElem('start-ts', $assessStartTs, $indent1);
+    print ASFILE XmlElem('stop-ts', $assessStopTs, $indent1);
+    print ASFILE XmlCloseTag('assessment-summary', $indent);
+    close ASFILE or die "close $asFile: $!";
+
+    return ($pass, $fail, $skip);
+}
+
+
+
+#####################################################################
+
+
+sub DoAssessment
+{
+    my ($data, $toolType, $resultsDir, $toolPath, $toolOpt, $toolConfFile, $toolDir,
+		$servicesConfFile, $toolsBaseDir) = @_;
+    my ($pass, $fail, $skip);
+
+    die "DoAssessment resultDir ($resultsDir) does not exist" unless -d $resultsDir;
+    
+    if ($toolType eq 'cloc' || $toolType eq 'lizard')  {
+	($pass, $fail, $skip) = DoMetricAssessment(@_);
+    }  elsif ($toolType eq 'cppcheck')  {
+	($pass, $fail, $skip) = DoCppcheckAssessment(@_);
+    }  elsif ($toolType eq 'clang-sa')  {
+	($pass, $fail, $skip) = DoClangSaAssessment(@_);
+    }  elsif ($toolType eq 'gcc-warn')  {
+	($pass, $fail, $skip) = DoGccWarnAssessment(@_);
+    }  elsif ($toolType eq 'ps-ctest')  {
+	($pass, $fail, $skip) = DoParasoftCtestAssessment(@_);
+    }  elsif ($toolType eq 'hrl-tif')  {
+	($pass, $fail, $skip) = DoHrlTifAssessment(@_);
+    }  elsif ($toolType eq 'gt-csonar' || $toolType eq 'csonar')  {
+	($pass, $fail, $skip) = DoCodeSonarAssessment(@_);
+    }  elsif ($toolType eq 'rl-goanna')  {
+	($pass, $fail, $skip) = DoGoannaAssessment(@_);
+    }  else  {
+	die "DoAssessment unknown tooltype ($toolType)";
+    }
+
+    return ($pass, $fail, $skip);
+}
+
+
+sub DoBuildAndProcess
+{
+    my $data = shift;
+    my ($startTs, $stopTs, $dur);
+
+    if (!$options{nobuild})  {
+	print STDERR scalar(localtime), "    Begin build\n";
+	$startTs = GetCurTs();
+	my ($exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus) = eval{BuildWithStrace(@ARGV)};
+	$stopTs = GetCurTs();
+	$dur = DiffTs($startTs, $stopTs);
+	print STDERR scalar(localtime), "    End build\n";
+	$@ = LogStatus('build', '', $@ ne '', $dur, $@);
+	die $@ if $@;
+    }  else  {
+	LogStatus('build', '--nobuild flag', -1, undef, '');
+    }
+
+    my $initialCwd = getcwd();
+    $options{packagerootdir} = $initialCwd unless defined $options{packagerootdir};
+    $options{buildrootdir} = $initialCwd unless defined $options{buildrootdir};
+    %$data = (
+		initialCwd	=> $initialCwd,
+		packageRootDir	=> $options{packagerootdir},
+		buildRootDir	=> $options{buildrootdir},
+		platName	=> $options{'plat-name'},
+		platUuid	=> $options{'plat-uuid'},
+		pkgName		=> $options{'pkg-name'},
+		pkgVersion	=> $options{'pkg-version'},
+		numEids		=> 0,
+		procs		=> {},
+		buildEids	=> [],
+		uuid		=> GetUuid()
+		);
+    print STDERR scalar(localtime), "    Begin Processing\n";
+    my $buildTraceDecodeFailureReason = '';
+    $startTs = GetCurTs();
+    eval {
+	ProcessStrace($options{strace}, \&ProcessSysCalls, $data);
+
+	# old versions of strace do not exit the same way as the traced process
+	# catch a failed top level process after processing the strace file
+	# and report the error
+	my $e = $data->{eids}{$data->{rootEid}};
+	my $exitStatus = $e->{exitStatus};
+	if (!defined $exitStatus || $exitStatus != 0)  {
+	    $buildTraceDecodeFailureReason = 'build';
+	    my $s = GetExecErrorMsg($e->{startArgs}, $exitStatus, $e->{exitSignal}, $e->{exitSignalName});
+	    die "Build failure but strace returned success [$s]";
+	}
+
+	FindAllBuildCommands($data, $data->{rootEid});
+	GetCmdInfo($data);
+    };
+    $stopTs = GetCurTs();
+    $dur = DiffTs($startTs, $stopTs);
+    my $savedStatus = LogStatus('build-trace-decode', $buildTraceDecodeFailureReason, $@ ne '', $dur, $@);
+
+    eval {
+	if ($options{buildsummary})  {
+	    open my $outFH, ">$options{buildsummary}" or die "open >$options{buildsummary}: $!";
+	    PrintBuildXml($outFH, $data, 0);
+	    close $outFH  or die "close <$options{buildsummary}: $!";
+	}
+
+	my $debugInfo = $options{debuginfo};
+	if (defined $debugInfo && $debugInfo ne '')  {
+	    PrintDebugInfo($debugInfo, $data);
+	}
+    };
+    print "$@\n" if $@ ne '';
+    $@ = $savedStatus if defined $savedStatus && $savedStatus ne '';
+
+    print STDERR scalar(localtime), "    End Processing\n";
+    die $@ if $@;
+}
+
+
+print STDERR scalar(localtime), "-------------------\n";
+
+my %data;
+eval {
+    ProcessOptions();
+    my $startTs = GetCurTs();
+    DoBuildAndProcess(\%data);
+    my $stopTs = GetCurTs();
+    my $dur = DiffTs($startTs, $stopTs);
+    if (ShouldStatusLog($@))  {
+	$@ = LogStatus('misc', 'DoBuildAndProcess', 1, undef, $@);
+	die $@;
+    }
+
+    if (defined $options{tooltype})  {
+	print STDERR scalar(localtime), "    Begin Assess\n";
+	$startTs = GetCurTs();
+	my @optionParams = qw/tooltype resultsdir toolpath toolopt toolconf tooldir servicesconf toolsbasedir/;
+	my ($pass, $fail, $skip) = eval {DoAssessment(\%data, @options{@optionParams})};
+	$stopTs = GetCurTs();
+	$dur = DiffTs($startTs, $stopTs);
+	if (!$@)  {
+	    my $s = "pass: $pass, fail: $fail";
+	    $s .= ", skip: $skip" if defined $skip;
+	    my $state = $fail != 0;
+	    $state = -1 if !$state && $pass == 0;
+	    LogStatus('assess', $s, $state, $dur, '');
+	    die "Assessment failed ($s)" if $state == 1;
+	}  else  {
+	    $@ = LogStatus('assess', '', 1, $dur, $@);
+	    die $@;
+	}
+	print STDERR scalar(localtime), "    End Assess\n";
+    }
+
+    print STDERR scalar(localtime), "    Done\n";
+};
+if ($@ ne '')  {
+    die RestoreStatusLogMsg($@);
+}

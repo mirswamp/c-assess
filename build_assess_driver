@@ -1,0 +1,1995 @@
+#!/usr/bin/perl -w
+
+#
+#  build_assess_driver   http://www.cs.wisc.edu/~kupsch
+# 
+#  Copyright 2013-2017 James A. Kupsch
+# 
+#  Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+# 
+#      http://www.apache.org/licenses/LICENSE-2.0
+# 
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+#
+ 
+
+use strict;
+use Config;
+use Cwd;
+use Getopt::Long;
+use Time::HiRes qw( gettimeofday );
+
+
+my $buildAssessDriverVersion = '1.1.7 (Apr 10, 2017)';
+my %options;
+my $statusFile;
+
+my $homeDir = getcwd();
+my $buildBaseDir = "$homeDir/build";
+my $resultsBaseDir = "$homeDir/results";
+my $toolsBaseDir = "$homeDir/tools";
+my $resultParserBaseDir = "$homeDir/result-parser";
+my $parsedResultsBaseDir = "$homeDir/parsed_results";
+
+
+sub PrintUsage
+{
+    my $progname = $0;
+    $progname =~ s/.*[\\\/]//;
+    print STDERR <<EOF;
+Usage: $progname [options] [<notes-location>...]
+
+options:
+    --help          -h print this message
+    --version	       print version
+    --in-dir	    -i set input directory ($options{'in-dir'})
+    --out-dir	    -o set output directory ($options{'out-dir'})
+    --base-dir	       user account neutral path to home (defaults to cwd)
+    --plat-name        set the platform name to use
+    --plat-uuid        set the uuid of the platform
+    --os-pkg-init-cmd  command to initialize OS package list
+    --os-pkg-install-cmd
+                       command to update OS packages
+    --no-sys-deps      do not apply system dependencies package updates
+    --goal          -g set the goal overriding run.conf
+    --verbose	       verbose output
+EOF
+}
+
+
+sub PrintVersion
+{
+    my $progname = $0;
+    $progname =~ s/.*(\\\/)//;
+    print "$progname version $buildAssessDriverVersion\n";
+}
+
+
+sub ProcessOptions
+{
+    %options = (
+		help			=> 0,
+		version			=> 0,
+		'in-dir'		=> '/mnt/in',
+		'out-dir'		=> '/mnt/out',
+		'base-dir'		=> undef,
+		'plat-name'		=> undef,
+		'plat-uuid'		=> undef,
+		'os-pkg-init-cmd'	=> undef,
+		'os-pkg-install-cmd'	=> undef,
+		'no-sys-deps'		=> 0,
+		'goal'			=> undef,
+		verbose			=> 0
+		);
+
+    my @options = (
+		"help|h!",
+		"version",
+		"in-dir|i=s",
+		"out-dir|o=s",
+		"base-dir=s",
+		"plat-name=s",
+		"plat-uuid=s",
+		"os-pkg-init-cmd=s",
+		"os-pkg-install-cmd=s",
+		"no-sys-deps",
+		"goal|g=s",
+		"verbose!"
+		);
+    
+    Getopt::Long::Configure(qw/require_order no_ignore_case no_auto_abbrev/);
+    my $ok = GetOptions(\%options, @options);
+
+    $options{'base-dir'} = $homeDir unless defined $options{'base-dir'};
+
+    if (!$ok || $options{help})  {
+	PrintUsage();
+	exit !$ok;
+    }
+
+    if ($options{version})  {
+	PrintVersion();
+	exit 0;
+    }
+}
+
+
+sub SplitTs
+{
+    my $ts = shift;
+    my ($s, $m);
+
+    if ($ts =~ /^(\d+)\.(\d*)$/)  {
+	$s = 0 + $1;
+	$m = 0 + substr("${2}000000", 0, 6);
+    }  elsif ($ts =~ /^(\d+)$/)  {
+	$s = 0 + $1;
+	$m = 0;
+    }  else  {
+	die "Invalid timestamp ($ts)";
+    }
+
+    return ($s, $m);
+}
+
+
+sub JoinTs
+{
+    my ($s, $m) = @_;
+
+    return sprintf "%d.%06d", $s, $m;
+}
+
+
+sub MakeTs
+{
+    my $t = shift;
+
+    return JoinTs SplitTs $t;
+}
+
+
+sub GetCurTs
+{
+    return JoinTs gettimeofday();
+}
+
+
+sub DiffTs
+{
+    my ($startTs, $stopTs) = @_;
+
+    my ($startS, $startMicroS) = SplitTs($startTs);
+    my ($stopS, $stopMicroS) = SplitTs($stopTs);
+
+    my ($s, $m) = ($stopS - $startS, $stopMicroS - $startMicroS);
+
+    if ($m < 0)  {
+	--$s;
+	$m += 1000000;
+    }
+
+    return JoinTs($s, $m);
+}
+
+
+sub HasValue
+{
+    my $s = shift;
+    return defined $s && $s ne '';
+}
+
+
+# return 0      if $b is 0  false  no   <undefined>  <empty>
+# # return 1      if $b is 1  true   yes
+# # return undef  if $b is anything else
+sub BoolValue
+{
+    my $b = shift;
+
+    return 0 if !HasValue($b) || $b =~ /^(0|false|no)$/i;
+    return 1 if $b =~ /^(1|true|yes)$/i;
+    return undef;
+}
+
+
+my $logged = 'logged: ';
+sub ShouldStatusLog
+{
+    my $s = shift;
+    return HasValue($s) && $s !~ /^$logged/;
+}
+
+
+sub RestoreStatusLogMsg
+{
+    my $msg = shift;
+    $msg =~ s/^$logged//;
+    return $msg;
+}
+
+
+sub LogIt
+{
+    my $msg = shift;
+    $msg .= "\n" unless $msg =~ /\n$/;
+    my $ts = GetCurTs();
+
+    print "++ $ts ++ $msg";
+}
+
+
+sub AppendException
+{
+    my ($savedErrs, $newErr) = @_;
+
+    if ($newErr ne '')  {
+	$savedErrs .= "; " if $savedErrs ne '';
+	$savedErrs .= $newErr;
+    }
+
+    return $savedErrs;
+}
+
+
+sub LogStatus
+{
+    my ($task, $shortMsg, $state, $dur, $msg) = @_;
+
+    return unless defined $statusFile;
+
+    my $div = "----------\n";
+    my $prefix = '  ';
+    $state = 0 unless $state;
+    my %stateToMsg = (0 => 'PASS', 1 => 'FAIL', -1 => 'SKIP', -2 => 'NOTE');
+    die "LogStatus: unknown state ($state)" unless defined $stateToMsg{$state};
+    my $stateMsg = $stateToMsg{$state};
+    $dur = '' unless defined $dur;
+    $dur = MakeTs($dur) . 's' unless $dur eq '';
+    $task .= " ($shortMsg)" if HasValue $shortMsg;
+
+    my $newMsg = $msg;
+
+    my $s = sprintf "%s: %-59s %14s\n", $stateMsg, $task, $dur;
+    if (ShouldStatusLog($msg))  {
+	$newMsg = "${logged}$msg";
+	$msg .= "\n" unless substr($msg, -1, 1) eq "\n";
+	$msg =~ s/^/$prefix/gm;
+	$s .= "$prefix$div$msg$prefix$div";
+    }
+
+    open STATUSFILE, ">>", $statusFile or die "open $statusFile: $!";
+    printf STATUSFILE $s;
+    close STATUSFILE or die "close $statusFile: $!";
+    LogIt $s;
+
+    return $newMsg;
+}
+
+
+sub ErrorLogIt
+{
+    my $msg = shift;
+    $msg .= "\n" unless $msg =~ /\n$/;
+
+    print STDERR $msg;
+}
+
+
+sub ReadTaskInfoFile
+{
+    my ($filename) = @_;
+
+    open FILE, '<', $filename or die "open <$filename: $!";
+    # first line is the short message
+    my $shortMsg = <FILE>;
+    my $state;
+    my $longMsg = '';
+    if (defined $shortMsg)  {
+	chomp $shortMsg;
+
+	my $line = <FILE>;
+	if (defined $line)  {
+	    chomp $line;
+	    # next line is the state (PASS, FAIL, SKIP or NOTE),
+	    # or the long message divider and state is PASS
+	    if ($line !~ /^-+$/)  {
+		my %stateToValue = (PASS => 0, FAIL => 1, SKIP => -1, NOTE => -2);
+		die "Unknown state '$line' in ReadTaskInfoFile($filename)"
+			unless exists $stateToValue{$line};
+		$state = $stateToValue{$line};
+		$line = <FILE>;
+	    }  else  {
+		$state = 0;
+	    }
+	}
+	if (defined $line)  {
+	    # if the line exists, it must be the long message divider
+	    chomp $line;
+	    die "Invalid long message separator '$line' in ReadTaskInfoFile($filename)"
+		    unless $line =~ /^-+$/;
+
+	    # the remainder of the file is the long message
+	    {
+		local $/;
+		$longMsg = <FILE>;
+	    }
+	    chomp $longMsg if defined $longMsg;
+	}
+    }
+    close FILE or die "close $filename: $!";
+
+    my @results = ($shortMsg, $state, $longMsg);
+
+    return @results;
+}
+
+
+sub ReadFile
+{
+    my ($fn, $justFirstLine) = @_;
+
+    open INFILE, "<", $fn or die "open $fn: $!";
+    my $f = <INFILE>;
+    $f = '' unless defined $f;
+    my $r;
+    if (!$justFirstLine)  {
+	local $/;
+	$r = <INFILE> if defined $f;
+    }
+    close INFILE or die "close $fn: $!";
+
+    if (wantarray)  {
+	chomp $f;
+	chomp $r if defined $r;
+	return ($f, $r);
+    }  else  {
+	$f .= $r if defined $r;
+	chomp $f;
+	return $f;
+    }
+}
+
+
+sub GetUnameM
+{
+    my $m = `uname -m`;
+    chomp $m;
+
+    return $m;
+}
+
+
+sub GetPlatformParams
+{
+    my ($options) = @_;
+    my $cAssessOptions = $options->{'#c-assess-options'};
+
+    my ($sysType, $pkgInstallInit, $pkgInstallCmd, $validExits);
+    $sysType = $options{'plat-name'};
+    $pkgInstallInit = $options{'os-pkg-init-cmd'};
+    $pkgInstallCmd = $options{'os-pkg-install-cmd'};
+
+    if (!defined $sysType)  {
+	if (HasValue $cAssessOptions->{'get-platform-cmd'})  {
+	    my $cmd = InFile($cAssessOptions->{'get-platform-cmd'});
+	    ($sysType) = PrintAndExecCmdGetOutputAndFail($cmd);
+	    chomp $sysType;
+	}  else  {
+	    # pre-V2 platforms do not pass sysType, pkgInstallInit, or pkgInstallCmd on the command line
+	    my $redhatRelease = '/etc/redhat-release';
+	    my $debianRelease = '/etc/debian_version';
+
+	    my $distro;
+	    my $ver;
+	    my $bits;
+	    my $machType = GetUnameM();
+	    if ($machType eq "x86_64")  {
+		$bits = "64";
+	    }  elsif ($machType eq "i686")  {
+		$bits = "32";
+	    }  else  {
+		die "Unknown machine type '$machType'";
+	    }
+
+	    if (-f $redhatRelease)  {
+		my $rel = ReadFile($redhatRelease, 1);
+
+		if ($rel =~ /^Red Hat Enterprise Linux Server release ([0-9.]+) \(/)  {
+		    $distro = 'rhel';
+		    $ver = $1;
+		}  elsif ($rel =~ /Fedora release (\d+)/)  {
+		    $distro = 'fedora';
+		    $ver = "$1.0";
+		}  elsif ($rel =~ /Scientific Linux release ([0-9.]+) \(/)  {
+		    $distro = 'scientific';
+		    $ver = $1;
+		}
+	    }  elsif (-f $debianRelease)  {
+		my $rel = ReadFile($debianRelease, 1);
+
+		if ($rel eq '7.1')  {
+		    $distro = 'debian';
+		    $ver = '7.0';
+		}  elsif ($rel eq 'wheezy/sid')  {
+		    $distro = 'ubuntu';
+		    $ver = '12.04';
+		}
+	    }
+	    if (!defined $distro)  {
+		$distro = lc `lsb_release --id`;
+		$distro =~ s/^(?:.+?:)?\s*(.*?)\s*$/$1/;
+		$distro = 'rhel' if $distro eq 'redhatenterpriseserver';
+	    }
+	    if (!defined $ver)  {
+		$ver = lc `lsb_release --release`;
+		$ver =~ s/^(?:.+?:)?\s*(.*?)\s*$/$1/;
+	    }
+
+	    if (defined $distro && defined $ver && defined $bits)  {
+		$sysType="$distro-$ver-$bits";
+	    }  else  {
+		die "unknown-release";
+	    }
+	}
+
+	$options{'plat-name'} = $sysType unless defined $options{'plat-name'};
+    }
+
+    if (HasValue $cAssessOptions->{'install-dependencies-cmd'})  {
+	undef $pkgInstallInit;
+	$pkgInstallCmd = InFile($cAssessOptions->{'install-dependencies-cmd'});
+	$validExits = $cAssessOptions->{'install-dependencies-cmd-exits'}
+		if HasValue $cAssessOptions->{'install-dependencies-cmd-exits'};
+    }  elsif (!defined $pkgInstallInit || !defined $pkgInstallCmd)  {
+	my $pkgMgr;
+	$pkgMgr = "yum" if $sysType =~ /^(rhel|fedora|scientific)-/;
+	$pkgMgr = "apt" if $sysType =~ /^(debian|ubuntu)-/;
+	$pkgMgr = "yum" if !defined $pkgMgr && -e '/usr/bin/yum';
+	$pkgMgr = "apt" if !defined $pkgMgr && -e '/usr/bin/apt-get';
+
+	if ($pkgMgr eq 'yum')  {
+	    $pkgInstallCmd = 'sudo yum install -y' unless defined $pkgInstallCmd;
+	}  elsif ($pkgMgr eq 'apt')  {
+	    $pkgInstallInit = 'sudo apt-get -y update' unless defined $pkgInstallInit;
+	    $pkgInstallCmd = 'sudo apt-get install -y' unless defined $pkgInstallCmd;
+	}
+
+	$options{'os-pkg-init-cmd'} = $pkgInstallInit if defined $pkgInstallInit;
+	$options{'os-pkg-install-cmd'} = $pkgInstallCmd if defined $pkgInstallCmd;
+    }
+
+    return ($sysType, $pkgInstallInit, $pkgInstallCmd, $validExits);
+}
+
+
+# Read a configuration file containing keys and values, returning a reference to
+# a hash containing the keys mapped to values.  The key and value are separated
+# by the '=' and more generally ':<MODIFIER_CHARS>='.  The MODIFIER_CHARS allow
+# the value to contain arbitrary whitespace and new-line characters.  The
+# MODIFIER_CHARS are case insensitive.
+#
+# The key is the characters from the current place in the file to the first '='
+# or last ':' before the first '='.  Leading and trailing whitespace surrounding
+# the key are removed (all other characters are preserved).  Duplicate keys
+# replace prior values.
+#
+# Configuration file lines are of the following form:
+#
+# - blank or all whitespace lines are skipped
+# - comment lines (first non-whitespace is a '#') are skipped
+# - k = v		adds k => v to hash, leading and trailing whitespace is
+# 			removed
+# - k :<COUNT>L=v	add k => VALUE to hash, where VALUE is the next <COUNT>
+# 			lines with whitespace and new lines preserved, except
+# 			the final new line.  If the file does not contain
+# 			<COUNT> additional lines it is an error.
+# - k :=v		same at 'k :1L=v'
+# - k :<COUNT>C=v	add k => Value to hash, where VALUE is the next <COUNT>
+# 			characters after the '=' with whitespace and new lines
+# 			preserved,  If the file does not contain <COUNT>
+# 			additonal characters it is an error.  Processing of the
+# 			next key begins at the next character even if it is on
+# 			the same line as part of the value.
+# - other lines such as those lacking a '=', or an empty key after whitespace
+#   removal are errors
+#
+# To aid human readability of configuration files, creators of configuration
+# files are encouraged to use 'k = v' where the value does not contain a leading
+# or trailing whitespace and there are no new line characters in v, 'k :=v'
+# where v does not contain a new-line character, and one of the other forms only
+# when v contains a new-line character.  Comments and blank lines can be used to
+# increase readability.  If the 'k :<COUNT>C=v' form is used a new-line is
+# encouraged after the value so each key starts on its own line.
+#
+#
+sub ReadConfFile
+{
+    my ($filename, $required) = @_;
+    my $lineNum = 0;
+    my $colNum = 0;
+    my $linesToRead = 0;
+    my $charsToRead = 0;
+    my %h;
+    $h{'#filenameofconffile'} = $filename;
+
+    open my $confFile, "<$filename" or die "Open configuration file '$filename' failed: $!";
+    my ($line, $k, $kLine, $err);
+    while (1)  {
+	if (!defined $line)  {
+	    $line = <$confFile>;
+	    last unless defined $line;
+	    ++$lineNum;
+	    $colNum = 1;
+	}
+
+	if ($linesToRead > 0)  {
+	    --$linesToRead;
+	    chomp $line if $linesToRead == 0;
+	    $h{$k} .= $line;
+	}  elsif ($charsToRead > 0)  {
+	    my $v = substr($line, 0, $charsToRead, '');
+	    $colNum = length $v;
+	    $charsToRead -= $colNum;
+	    $h{$k} .= $v;
+	    redo if length $line > 0;
+	}  elsif ($line !~ /^\s*(#|$)/)  {
+	    # line is not blank or a comment (first non-whitespace is a '#')
+	    if ($line =~ /^\s*(.*?)\s*(?::([^:]*?))?=(\s*(.*?)\s*)$/)  {
+		my ($u, $wholeV, $v) = ($2, $3, $4);
+		$k = $1;
+		$kLine = $lineNum;
+		if ($k eq '')  {
+		    chomp $line;
+		    $err = "missing key, line is '$line'";
+		    last;
+		}
+		if (!defined $u)  {
+		    # normal 'k = v' line
+		    $h{$k} = $v;
+		}  else  {
+		    # 'k :<COUNT><UNIT>= v' line
+		    $u = '1L' if $u eq '';
+		    if ($u =~ /^(\d+)L$/i)  {
+			$linesToRead = $1;
+		    }  elsif ($u =~ /^(\d+)C$/i)  {
+			$charsToRead = $1;
+			$colNum = length($line) - length($wholeV);
+		    }  else  {
+			$err = "unknown units ':$u='";
+			last;
+		    }
+		    $h{$k} = '';
+		    $line = $wholeV;
+		    redo;
+		}
+	    }  else  {
+		chomp $line;
+		$err = "bad line (no '='), line is '$line'";
+		last;
+	    }
+	}
+	undef $line;
+    }
+    close $confFile or defined $err or die "Close configuration file '$filename' failed: $!";
+
+    if (defined $err)  {
+	my $loc = "line $lineNum";
+	$loc .= " column $colNum" unless $colNum == 1;
+	die "Configuration file '$filename' $loc $err";
+    }
+
+    if ($linesToRead > 0)  {
+	die "Configuration file '$filename' missing $linesToRead lines for key '$k' at line $kLine";
+    }
+
+    if ($charsToRead > 0)  {
+	die "Configuration file '$filename' missing $charsToRead characters for key '$k' at line $kLine";
+    }
+
+    if (defined $required)  {
+	my @missing = grep { !HasValue $h{$_}; } @$required;
+	if (@missing)  {
+	    die "Configuration file '$filename' missing required keys: " . join(", ", @missing);
+	}
+    }
+
+    return \%h;
+}
+
+
+sub EvalString
+{
+    my ($s, $h, $l) = @_;
+
+    $l = 1 unless defined $l;
+
+    eval  {
+	$s =~ s/%(%|[-a-zA-Z0-9_.:]+|\{[-a-zA-Z0-9_.:]+\})/EvalHashValue($1, $h, $l)/eg;
+    };
+    if ($@)  {
+	my $e = $@;
+	if ($l == 1)  {
+	    if ($e =~ /^EvalError:\s+(.*)\s+at/)  {
+		$e = "EvalError: Evaluating string '$s' failed: $1";
+	    }
+	}
+	die $e;
+    }
+
+    return $s;
+}
+
+
+sub EvalHashValue
+{
+    my ($k, $h, $l) = @_;
+
+    return $k if $k eq '%';
+    $l = 0 unless defined $l;
+    $k =~ s/^{(.*)}$/$1/;
+    die "EvalError: too much recursion" if ++$l > 50;
+    die "EvalError: key '$k' not found" unless exists $h->{$k};
+    die "EvalError: value of key '$k' not defined" unless defined $h->{$k};
+
+    my $s = $h->{$k};
+    eval  {
+#	my $cacheKey = '#cache'
+#	if (exists $h->{$cacheKey}{$k})  {
+#	    $s = $h->{$cacheKey}{$k};
+#	}  else  {
+	    $s = EvalString($s, $h, $l);
+#	    $h->{$cacheKey}{$k} = $s;
+#	}
+    };
+    if ($@)  {
+	my $e = $@;
+	if ($l == 1)  {
+	    if ($e =~ /^EvalError:\s+(.*)\s+at/)  {
+		$e = "EvalError: Evaluating key '$k' failed: $1";
+	    }
+	}
+	die $e;
+    }
+
+    return $s;
+}
+
+
+sub GenPkgConfLine
+{
+    my ($p, $k, $name) = @_;
+    my $s = '';
+
+    if (exists $p->{$k})  {
+	my $v = $p->{$k};
+	my $numLines = ($v =~ tr/\n//) + 1;
+	my $sep;
+
+	if ($numLines != 1)  {
+	    $sep = ":${numLines}L=";
+	}  elsif ($v =~ /^\s+|\s+$/)  {
+	    $sep = ":=";
+	}  else  {
+	    $sep = "=";
+	}
+
+	$s = "$name$sep$v\n";
+    }
+
+    return $s;
+}
+
+
+sub WriteConfFile
+{
+    my ($filename, $confKeys) = @_;
+
+    open CONFFILE, ">", $filename or die "open > $filename: $!";
+    foreach my $k (sort keys %$confKeys)  {
+	my $v = $confKeys->{$k};
+	die "leading whitespace in key: filename='$filename' k='$k' v='$v'" if $k =~ /^\s/;
+	die "trailing whitespace in key: filename='$filename' k='$k' v='$v'" if $k =~ /\s$/;
+	die "'=' in key: filename='$filename' k='$k' v='$v'" if $k =~ /=/;
+
+	my $numLines = ($v =~ tr/\n//) + 1;
+	my $sep;
+
+	if ($numLines != 1)  {
+	    $sep = ":${numLines}L=";
+	}  elsif ($v =~ /^\s+|\s+$/)  {
+	    $sep = ":=";
+	}  else  {
+	    $sep = "= ";
+	}
+
+	print CONFFILE "$k $sep$v\n";
+    }
+    close CONFFILE or die "close $filename";
+}
+
+
+sub GetEnvHashFromArray
+{
+    my $env = shift;
+    my %env;
+
+    return $env if ref($env) eq 'HASH';
+    die "GetEnvHashFromArray arg not HASH or ARRAY" unless ref($env) eq 'ARRAY';
+
+    foreach my $v (@$env)  {
+	my ($k, $v) = split /=/, $v, 2;
+	$v = '' unless defined $v;
+	$env{$k} = $v;
+    }
+
+    return \%env;
+}
+
+
+sub ExecCmd
+{
+    my ($args, $env, $execPath, $outFile, $errFile) = @_;
+
+    my $cmd;
+    if (ref($args) eq '')  {
+	$cmd = $args;
+    }  else  {
+	$execPath = $args->[0] unless defined $execPath;
+    }
+
+    my ($savedStdout, $savedStderr);
+    if (defined $outFile)  {
+	$outFile = '/dev/null' if $outFile eq '';
+	open $savedStdout, ">&", \*STDOUT or die "open savedStdout, >& STDOUT dup: $!";
+	open STDOUT, ">", $outFile or die "open STDOUT, >$outFile: $!\n";
+    }
+
+    if (defined $errFile)  {
+	$errFile = '/dev/null' if $errFile eq '';
+	open $savedStderr, ">&", \*STDERR or die "open savedStdErr, >& STDERR dup: $!";
+	open STDERR, ">", $errFile or die "open STDERR, >$errFile: $!\n";
+    }
+
+    my %savedEnv;
+    if (defined $env)  {
+	%savedEnv = %ENV;
+	$env = GetEnvHashFromArray($env);
+	%ENV = %$env;
+    }
+
+    if (defined $cmd)  {
+	system $cmd;
+    }  else  {
+	system {$execPath} @$args;
+    }
+    my $exitStatus = $?;
+    my $exitMsg = $!;
+
+    if (defined $env)  {
+	%ENV = %savedEnv;
+    }
+
+    if (defined $outFile)  {
+	close STDOUT or die "close STDOUT to restore stdout: $!";
+	open STDOUT, ">&", $savedStdout or die "open STDOUT, >& savedStdout dup restoring stdout: $!";
+    }
+
+    if (defined $errFile)  {
+	close STDERR or die "close STDERR to restore stderr: $!";
+	open STDERR, ">&", $savedStderr or die "open STDERR, >& savedStderr dup restoring stderr: $!";
+    }
+
+    my $exitCode;
+    my $exitSignal;
+    my $exitSignalName;
+    my $exitErrnoMsg;
+
+    if ($exitStatus == -1)  {
+	$exitErrnoMsg = $exitMsg;
+    }  elsif ($exitStatus & 127)  {
+	$exitSignal = $exitStatus & 127;
+	my $sig = (split ' ', $Config{sig_name})[$exitSignal];
+	$exitSignalName = "SIG$sig" if defined $sig;
+    }  else  {
+	$exitCode = $exitStatus >> 8;
+    }
+
+    return ($exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus);
+}
+
+
+my $bashNonMetaChars = qr/[a-zA-Z0-9.,_=+\/\@:-]/;
+
+sub HasBashMetaChars
+{
+    my $s = shift;
+    return ($s !~ /^$bashNonMetaChars*$/);
+}
+
+
+sub BashQuote
+{
+    my $s = shift;
+
+#   Simple and correct quoting, but verbose
+#
+#    return $s unless HasBashMetaChars($s);
+#    $s =~ s/'/'\\''/g;
+#    return "'$s'";
+
+    my @a = split /(')/, $s;
+    foreach (@a)  {
+	if (HasBashMetaChars($_))  {
+	    if ($_ eq "'")  {
+		$_ = "\\'";
+	    }  else  {
+		$_ = "'$_'";
+	    }
+	}
+    }
+    return join('', @a);
+}
+
+
+sub GetBashCmdString
+{
+    my $cmd = shift;
+    my $s;
+
+    if (ref($cmd) eq '')  {
+	$s = $cmd;
+    }  else  {
+	$s = join ' ', map {BashQuote $_} @$cmd;
+    }
+
+    return $s;
+}
+
+
+sub BashCmdStringToArray
+{
+    my $s = shift;
+    return $s unless ref $s eq '';
+    return $s if ($s !~ /^($bashNonMetaChars|\s)*$/);
+    my @a = split ' ', $s;
+    return \@a;
+}
+
+
+sub AppendToBashCmd
+{
+    my ($cmd, $args) = @_;
+
+    return $cmd unless HasValue $args;
+
+    if (ref $cmd eq 'ARRAY')  {
+	$args = BashCmdStringToArray($args);
+	if (ref $args eq 'ARRAY')  {
+	    my @a = (@$cmd, @$args);
+	    $cmd = \@a;
+	}  else  {
+	    $cmd = GetBashCmdString($cmd) . " $args";
+	}
+    }  else  {
+	$args = GetBashCmdString($args);
+	$cmd .= " $args";
+    }
+
+    return $cmd;
+}
+
+
+sub BashCmdToStringIfSetEnv
+{
+    my $cmd = shift;
+
+    if (ref $cmd eq 'ARRAY' && exists $cmd->[0] && defined $cmd->[0] && $cmd->[0] =~ /=/)  {
+	return GetBashCmdString($cmd);
+    }  else  {
+	return $cmd;
+    }
+}
+
+
+sub GetExecErrorMsg
+{
+    my ($cmd, $exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus) = @_;
+
+    my $s = GetBashCmdString($cmd) . " failed";
+    $s .= " with exitCode=$exitCode" if defined $exitCode;
+    $s .= " with signal" if defined $exitSignal || defined $exitSignalName;
+    $s .= " $exitSignalName" if defined $exitSignalName;
+    $s .= " ($exitSignal)" if defined $exitSignal;
+    $s .= " exec error ($exitErrnoMsg)" if defined $exitErrnoMsg;
+
+    return $s;
+}
+
+
+sub DiffEnv
+{
+    my ($oldEnvArray, $newEnvArray) = @_;
+    my (%added, %removed, %updated);
+    my $oldEnv = GetEnvHashFromArray($oldEnvArray);
+    my $newEnv = GetEnvHashFromArray($newEnvArray);
+
+    for my $k (keys %$oldEnv)  {
+	if (exists $newEnv->{$k})  {
+	    if ($oldEnv->{$k} ne $newEnv->{$k})  {
+		$updated{$k} = $newEnv->{$k};
+	    }
+	}  else  {
+	    $removed{$k} = undef;
+	}
+    }
+
+    for my $k (keys %$newEnv)  {
+	if (!exists $oldEnv->{$k})  {
+	    $added{$k} = $newEnv->{$k};
+	}
+    }
+
+    return (\%added, \%removed, \%updated);
+}
+
+
+sub GetEnvDiffString
+{
+    my ($oldEnv, $newEnv) = @_;
+    my ($added, $removed, $updated) = DiffEnv($oldEnv, $newEnv);
+    my $s = '';
+
+    foreach my $k (sort keys %$added)  {
+	my $v = BashQuote($added->{$k});
+	$s .= "export $k=$v\n";
+    }
+    foreach my $k (sort keys %$updated)  {
+	my $v = BashQuote($updated->{$k});
+	$s .= "export $k=$v\n";
+    }
+    foreach my $k (sort keys %$removed)  {
+	$s .= "unset $k\n";
+    }
+
+    return $s;
+}
+
+
+sub PrintAndExecCmd
+{
+    my ($cmd, $env) = @_;
+    # real args forwarded to ExecCmd ($args, $env, $execPath, $outFile, $errFile)
+
+    if (defined $env)  {
+	my $s = GetEnvDiffString(\%ENV, $env);
+	LogIt "Environment changes:\n$s" if $s ne '';
+    }
+    LogIt GetBashCmdString($cmd);
+
+    return ExecCmd(@_);
+}
+
+
+sub PrintAndExecCmdAndFail
+{
+    my ($cmd, $env, $execPath, $outFile, $errFile, $validExits) = @_;
+    # real args forwarded to PrindAndExecCmd ($args, $env, $execPath, $outFile, $errFile)
+
+    my @r = PrintAndExecCmd(@_);
+    my ($exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus) = @r;
+    
+    if ($exitStatus != 0)  {
+	if (!(defined $exitCode && defined $validExits && grep {$exitCode == $_} @$validExits))  {
+	    my $s = GetExecErrorMsg($cmd, @r);
+	    die $s;
+	}
+    }
+
+    return @r;
+}
+
+
+sub ExecCmdGetOutput
+{
+    my @cmd;
+    @cmd = (exists $_[0] && (ref $_[0] eq 'ARRAY')) ? @{$_[0]} : @_;
+    my $r;
+
+    open CMD, '-|', @cmd or die "open @cmd $!";
+
+    local $/;
+    my $s = <CMD>;
+
+    $r = close CMD;
+
+    my $exitStatus = $?;
+    my $exitMsg = $!;
+    my $exitCode;
+    my $exitSignal;
+    my $exitSignalName;
+    my $exitErrnoMsg;
+
+    if ($exitStatus == -1)  {
+	$exitErrnoMsg = $exitMsg;
+    }  elsif ($exitStatus & 127)  {
+	$exitSignal = $exitStatus & 127;
+	my $sig = (split ' ', $Config{sig_name})[$exitSignal];
+	$exitSignalName = "SIG$sig" if defined $sig;
+    }  else  {
+	$exitCode = $exitStatus >> 8;
+    }
+
+    my @r = ($s, $exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus);
+
+    return @r;
+}
+
+
+sub PrintAndExecCmdGetOutput
+{
+    my @cmd;
+    @cmd = (exists $_[0] && (ref $_[0] eq 'ARRAY')) ? @{$_[0]} : @_;
+
+    LogIt GetBashCmdString(\@_);
+
+    return ExecCmdGetOutput(@_);
+}
+
+
+sub PrintAndExecCmdGetOutputAndFail
+{
+    my @cmd;
+    @cmd = (exists $_[0] && (ref $_[0] eq 'ARRAY')) ? @{$_[0]} : @_;
+
+    my ($output, $exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus)
+		= PrintAndExecCmdGetOutput(@_);
+    
+    print "$output\n";
+
+    if ($exitStatus != 0)  {
+	my $s = GetExecErrorMsg(\@cmd, $exitCode, $exitSignal, $exitSignalName,
+				    $exitErrnoMsg, $exitStatus);
+	die $s;
+    }
+
+    return $output;
+}
+
+
+sub DoChdir
+{
+    my ($d, $type) = @_;
+    my $cmd = GetBashCmdString(['cd', $d]);
+
+    LogIt($cmd);
+    my $r = chdir $d;
+    if (!$r)  {
+	$type = 'misc' unless defined $type;
+	my $task = "chdir-$type";
+	my $msg = "Change to Directory '$d' failed: $!";
+	$@ = LogStatus($task, $!, 1, undef, $msg);
+	die $@;
+    }
+
+    # make PWD environment variable reflect current working directory
+    if (exists $ENV{PWD})  {
+	my $p = getcwd();
+	$ENV{PWD} = $p;
+	LogIt("export PWD=" . BashQuote($p));
+    }
+}
+
+
+sub DoMkdir
+{
+    my ($d, $type) = @_;
+    my $cmd = GetBashCmdString(['mkdir', $d]);
+
+    LogIt($cmd);
+    my $r = mkdir $d;
+    if (!$r)  {
+	$type = 'misc' unless defined $type;
+	my $task = "mkdir-$type";
+	my $msg = "Make Directory '$d' failed: $!";
+	$@ = LogStatus($task, $!, 1, undef, $msg);
+	die $@;
+    }
+}
+
+
+sub DoMkdirP
+{
+    my ($d, $type) = @_;
+
+    return if -d $d;
+
+    my $path = '';
+    $path = '/' if $d =~ s/^(\/+)//;
+
+    my @d = split /\//, $d;
+
+    while (@d)  {
+	$path .= shift(@d);
+	DoMkdir $path unless -d $path;
+	$path .= '/';
+    }
+}
+
+
+sub ConcatPaths
+{
+    my ($base, $path) = @_;
+
+    $base = '.' unless HasValue $base;
+    $path = '.' unless HasValue $path;
+
+    if ($path !~ /^\//)  {
+	$path = "$base/$path";
+    }
+
+    while ($path =~ s/\/\.\//\//g)  {
+    }
+    $path =~ s/\/\/+/\//g;
+    $path =~ s/\/\.?$//;
+    $path =~ s/^\.\///;
+    $path = '.' if $path eq '';
+
+    return $path;
+}
+
+
+sub HomeFile
+{
+    my $fn = shift;
+
+    return ConcatPaths($homeDir, $fn);
+}
+
+
+sub InFile
+{
+    my $fn = shift;
+
+    return ConcatPaths($options{'in-dir'}, $fn);
+}
+
+
+sub OutFile
+{
+    my $fn = shift;
+
+    return ConcatPaths($options{'out-dir'}, $fn);
+}
+
+
+sub BuildFile
+{
+    my $fn = shift;
+
+    return ConcatPaths($buildBaseDir, $fn);
+}
+
+
+sub HasMakeXz
+{
+    my ($sysType) = GetPlatformParams(\%options);
+
+    my $hasMakeXz = ($sysType !~ /^(scientific|centos|rhel)-5\D/);
+
+    return $hasMakeXz;
+}
+
+
+sub MakeArchiveExtractCmd
+{
+    my $archive = shift;
+    my $cmd;
+
+    die "ERROR: archive not set" unless defined $archive;
+
+    if ($archive =~ /\.(tar|tar\.(gz|bz2|xz|Z)|tgz|zip|[jerw]ar)$/)  {
+	if ($1 ne 'tar.xz' || HasMakeXz())  {
+	    my %suffixToUnarchiveCmd = (
+		'tar'		=> 'tar xf',
+		'tar.gz'	=> 'tar xzf',
+		'tgz'		=> 'tar xzf',
+		'tar.bz2'	=> 'tar xjf',
+		'tar.xz'	=> 'tar xJf',
+		'tar.Z'		=> 'tar xZf',
+		'zip'		=> 'unzip',
+		'jar'		=> 'jar xf',
+		'ear'		=> 'jar xf',
+		'rar'		=> 'jar xf',
+		'war'		=> 'jar xf'
+		);
+	    $cmd = $suffixToUnarchiveCmd{$1};
+	    $cmd = AppendToBashCmd($cmd, [$archive]);
+	}  else  {
+	    $cmd = "unxz -c";
+	    $cmd = AppendToBashCmd($cmd, [$archive]);
+	    $cmd = AppendToBashCmd($cmd, '| tar xf -');
+	}
+    }  else  {
+       die "ERROR: Unknown archive format for '$archive'";
+    }
+
+    return $cmd;
+}
+
+
+sub ArchiveExtractCmd
+{
+    my ($archiveKey, $data) = @_;
+
+    my $filename = $data->{'#filenameofconffile'};
+
+    my $archive = $data->{$archiveKey};
+
+    die "$archiveKey not defined in $filename" unless defined $archive;
+
+    return MakeArchiveExtractCmd(InFile($archive));
+}
+
+
+sub ArchiveExtract
+{
+    my ($confData, $confKey, $taskName) = @_;
+    my $cmd = ArchiveExtractCmd($confKey, $confData);
+    my $startTs = GetCurTs();
+    eval {PrintAndExecCmdAndFail($cmd)};
+    my $stopTs = GetCurTs();
+    my $dur = DiffTs($startTs, $stopTs);
+    $@ = LogStatus($taskName, '', $@ ne '', $dur, $@);
+    die $@ if $@ ne '';
+}
+
+
+sub ArchiveCreate
+{
+    my ($archiveDir, $confKeyPrefix, $xmlFileKeyPrefix, $xmlFile, $extraConf) = @_;
+    my $tarFileName = "${archiveDir}.tar.gz";
+    my $tarPath = OutFile($tarFileName);
+    my $savedErrs = '';
+    if (-e $archiveDir)  {
+	my $startTs = GetCurTs();
+	my @cmd = ('tar', 'czf', $tarPath, $archiveDir);
+	eval {PrintAndExecCmdAndFail(\@cmd)};
+	my $stopTs = GetCurTs();
+	my $dur = DiffTs($startTs, $stopTs);
+	my $savedErrs = LogStatus("${archiveDir}-archive", '', $@ ne '', $dur, $@);
+
+	my $confFile = "${archiveDir}.conf";
+	my $confPath = OutFile($confFile);
+	my $contents = <<EOF;
+${confKeyPrefix}-dir=$archiveDir
+${confKeyPrefix}-archive=$tarFileName
+${xmlFileKeyPrefix}-file=$xmlFile
+EOF
+	$contents .= "\n$extraConf" if defined $extraConf;
+	CreateFileWithContents($confPath, $contents);
+    }  else  {
+	$savedErrs .= LogStatus("${archiveDir}-archive", '', -1, undef, '');
+    }
+
+    die $savedErrs if $savedErrs ne '';
+}
+
+
+sub MakeConfigureCmd
+{
+    my $pkgData = shift;
+    my $buildSys = $pkgData->{'build-sys'};
+    my $configDir = $pkgData->{'config-dir'};
+    my $configCmd = $pkgData->{'config-cmd'};
+    my $configOpt = $pkgData->{'config-opt'};
+    $configDir = undef if defined $configDir && $configDir eq '';
+
+    if (!defined $configCmd || $configCmd eq '')  {
+	my %buildSysToConfigCmd = (
+	    'ant'		=> undef,
+	    'ant+ivy'		=> undef,
+	    'maven'		=> undef,
+	    'make'		=> undef,
+	    'configure+make'	=> './configure',
+	    'cmake+make'	=> 'cmake .',
+	    'no-build'		=> undef,
+	    'other'		=> undef,
+	    'none'		=> undef
+	    );
+	    # gradle java-bytecode python-distutils
+	    # android+ant android+ant+ivy android+maven android+gradle
+	die "ERROR: Unknown buildSys '$buildSys' and build-cmd not set"
+		if !exists $buildSysToConfigCmd{$buildSys};
+	$configCmd = $buildSysToConfigCmd{$buildSys};
+    }
+
+    my $cmd;
+    if (HasValue $configCmd)  {
+	$cmd = BashCmdStringToArray($configCmd);
+	$cmd = AppendToBashCmd($cmd, $configOpt)
+    }
+
+    $cmd = BashCmdToStringIfSetEnv($cmd);
+
+    return ($configDir, $cmd);
+}
+
+
+sub MakeBuildCmd
+{
+    my $pkgData = shift;
+
+    my $buildSys = $pkgData->{'build-sys'};
+    my $dir = $pkgData->{'build-dir'};
+    my $buildCmd = $pkgData->{'build-cmd'};
+    my $buildFile = $pkgData->{'build-file'};
+    my $buildOpt = $pkgData->{'build-opt'};
+    my $buildTarget = $pkgData->{'build-target'};
+    $dir = undef unless HasValue $dir;
+
+    if (!defined $buildCmd || $buildCmd eq '')  {
+	my %buildSysToBuildCmd = (
+	    'ant'		=> 'ant',
+	    'ant+ivy'		=> 'ant',
+	    'maven'		=> 'mvn',
+	    'make'		=> 'make',
+	    'configure+make'	=> 'make',
+	    'cmake+make'	=> 'make',
+	    'no-build'		=> 'make',
+	    'other'		=> undef,
+	    'none'		=> undef
+	    );
+	    # gradle java-bytecode python-distutils
+	    # android+ant android+ant+ivy android+maven android+gradle
+	die "ERROR: Unknown buildSys '$buildSys' and build-cmd not set"
+		if !exists $buildSysToBuildCmd{$buildSys};
+	$buildCmd = $buildSysToBuildCmd{$buildSys};
+	die "ERROR: 'build-sys' type of '$buildSys' and 'build-cmd' is not defined"
+		unless HasValue $buildCmd || $buildSys eq 'none';
+
+	return ($dir, undef) unless defined $buildCmd;
+    }
+
+    my $cmd = BashCmdStringToArray($buildCmd);
+    if (HasValue $buildFile)  {
+	if ($buildCmd eq 'ant')  {
+	    $cmd = AppendToBashCmd($cmd, ['-buildfile', $buildFile]);
+	}  elsif ($buildCmd eq 'mvn')  {
+	    $cmd = AppendToBashCmd($cmd, ['-filename', $buildFile]);
+	}  elsif ($buildCmd eq 'make')  {
+	    $cmd = AppendToBashCmd($cmd, ['-f', $buildFile]);
+	}  else   {
+	    die "ERROR unknown buildCommand '$buildCmd'";
+	}
+    }
+    $cmd = AppendToBashCmd($cmd, $buildOpt);
+    $cmd = AppendToBashCmd($cmd, $buildTarget);
+
+    $cmd = BashCmdToStringIfSetEnv($cmd);
+
+    return ($dir, $cmd);
+}
+
+
+sub CreateFileWithContents
+{
+    my ($filename, $data) = @_;
+
+    open OUT, ">", $filename or die "open $filename: $!";
+    print OUT $data;
+    close OUT or die "close $filename: $!";
+}
+
+
+sub DoPreAssess
+{
+    DoMkdir($resultsBaseDir) if !-d $resultsBaseDir;
+    DoMkdir($toolsBaseDir) if !-d $toolsBaseDir;
+
+    my $toolConfFile = InFile('tool.conf');
+    my $servicesConfFile = InFile('services.conf');
+    my $toolData = ReadConfFile($toolConfFile);
+
+    my $toolArchive = $toolData->{'tool-archive'};
+    my $toolDir = $toolData->{'tool-dir'};
+    my $toolCmd = $toolData->{'tool-cmd'};
+    my $toolType = $toolData->{'tool-type'};
+    my $toolOpt = $toolData->{'tool-opt'};
+    my $toolInstallCmd = $toolData->{'tool-install-cmd'};
+    my $toolInstallOpt = $toolData->{'tool-install-opt'};
+    my $toolBaseDir = ConcatPaths($toolsBaseDir, $toolDir);
+    my $toolPath;
+    if (HasValue $toolCmd)  {
+	$toolPath = ConcatPaths($toolBaseDir, $toolCmd);
+    }
+
+    die "tool-type not set in $toolConfFile" unless HasValue $toolType;
+
+    if (HasValue $toolArchive)  {
+	DoChdir($toolsBaseDir);
+	ArchiveExtract($toolData, 'tool-archive', 'tool-unarchive');
+	DoChdir($homeDir);
+    }
+
+    if (HasValue $toolInstallCmd)  {
+	my $cmd = BashCmdStringToArray($toolInstallCmd);
+	$cmd = AppendToBashCmd($cmd, $toolInstallOpt) if HasValue $toolInstallOpt;
+	$cmd = BashCmdToStringIfSetEnv($cmd);
+	my $startTs = GetCurTs();
+	eval {
+	    DoChdir($toolsBaseDir);
+	    PrintAndExecCmdAndFail($cmd, undef, undef, undef, undef);
+	};
+	my $stopTs = GetCurTs();
+	my $dur = DiffTs($startTs, $stopTs);
+	$@ = LogStatus('tool-install', '', $@ ne '', $dur, $@);
+	DoChdir($homeDir);
+	die $@ if $@ ne '';
+    }
+
+    my @extraBuildbugOpts = ("--resultsdir=$resultsBaseDir", "--tooltype=$toolType", "--toolconf=$toolConfFile");
+    push @extraBuildbugOpts, "--toolpath=$toolPath" if HasValue $toolPath;
+    push @extraBuildbugOpts, "--toolopt=$toolOpt" if HasValue $toolOpt;
+    push @extraBuildbugOpts, "--tooldir=$toolBaseDir" if HasValue $toolBaseDir;
+    push @extraBuildbugOpts, "--servicesconf=$servicesConfFile" if -f $servicesConfFile;
+    push @extraBuildbugOpts, "--toolsbasedir=$toolsBaseDir" if HasValue $toolsBaseDir;
+
+    return \@extraBuildbugOpts;
+}
+
+
+sub DoBuild
+{
+    my ($pkgData, $buildbugCmd, $configureStdout, $configureStderr) = @_;
+
+    DoMkdir($buildBaseDir) if !-d $buildBaseDir;
+    DoChdir($buildBaseDir);
+
+    my $pkgBaseDir = BuildFile('pkg1');
+    DoMkdir($pkgBaseDir);
+    DoChdir($pkgBaseDir);
+
+    ArchiveExtract($pkgData, 'package-archive', 'package-unarchive');
+
+    my $packageDir = $pkgData->{'package-dir'};
+    my $pkgDir = ConcatPaths($pkgBaseDir, $packageDir);
+    $buildbugCmd = AppendToBashCmd($buildbugCmd,
+	    ["--packagerootdir=$pkgBaseDir", "--buildrootdir=$buildBaseDir"])
+		    if defined $buildbugCmd;
+
+    DoChdir($pkgDir, 'package-dir');
+    
+    my $sourceCompilesFile;
+    my ($startTs, $stopTs, $dur);
+    eval {
+	my ($dir, $cmd) = MakeConfigureCmd($pkgData);
+	if (defined $cmd)  {
+	    $startTs = GetCurTs();
+	    eval {
+		DoChdir($dir, 'config-dir') if defined $dir;
+		PrintAndExecCmdAndFail($cmd, undef, undef, $configureStdout, $configureStderr);
+	    };
+	    $stopTs = GetCurTs();
+	    $dur = DiffTs($startTs, $stopTs);
+	    $@ = LogStatus('configure', '', $@ ne '', $dur, $@);
+	    DoChdir($pkgDir, 'package-dir') if defined $dir;
+	    die $@ if $@ ne '';
+	}
+
+	if ($pkgData->{'build-sys'} eq 'no-build')  {
+	    my $shortMsg = '';
+	    $startTs = GetCurTs();
+	    eval  {
+		my $buildSys = 'make';
+		my $buildFile = BuildFile("noBuild.mk");
+		my $platName = $options{'plat-name'};
+		my $pkgShortName = $pkgData->{'package-short-name'};
+		my $pkgVersion = $pkgData->{'package-version'};
+		($dir, $cmd) = MakeBuildCmd($pkgData);
+		my $buildRootDir = ConcatPaths($pkgDir, $dir);
+		$sourceCompilesFile = 'source-compiles.xml';
+		my $sourceCompilesPath = OutFile($sourceCompilesFile);
+		my $shortMsgFile = 'no-build-helper-msg.out';
+		my $shortMsgPath = BuildFile($shortMsgFile);
+		$pkgData->{'build-sys'} = $buildSys;
+		$pkgData->{'build-file'} = $buildFile;
+		delete $pkgData->{'build-target'};
+		my @cmd = (
+			    InFile('no_build_helper'),
+			    "--build-sys=$buildSys",
+			    "--build-file=$buildFile",
+			    "--source-compiles=$sourceCompilesPath"
+			    );
+		push @cmd, "--package-short-name=$pkgShortName" if defined $pkgShortName;
+		push @cmd, "--package-version=$pkgVersion" if defined $pkgVersion;
+		push @cmd, "--platform=$platName" if defined $platName;
+		push @cmd, "--package-root-dir=$pkgDir" if defined $pkgDir;
+		push @cmd, "--build-root-dir=$buildRootDir" if defined $buildRootDir;
+		push @cmd, "--msg=$shortMsgPath" if defined $shortMsgPath;
+		eval {PrintAndExecCmdAndFail(\@cmd)};
+		my $savedErrs = $@;
+
+		eval {
+		    $shortMsg = ReadFile($shortMsgPath, 1);
+		};
+		$savedErrs = AppendException($savedErrs, $@);
+
+		die $savedErrs if $savedErrs ne '';
+	    };
+	    DoChdir($pkgDir, 'package-dir') if defined $dir;
+	    $stopTs = GetCurTs();
+	    $dur = DiffTs($startTs, $stopTs);
+	    $@ = LogStatus('no-build-setup', $shortMsg, $@ ne '', $dur, $@);
+	    die $@ if $@ ne '';
+	}
+
+	($dir, $cmd) = MakeBuildCmd($pkgData);
+	if (defined $cmd)  {
+	    DoChdir($dir, 'build-dir') if defined $dir;
+	    $startTs = GetCurTs();
+	    if (defined $buildbugCmd)  {
+		if (ref $cmd eq '')  {
+		    $cmd = AppendToBashCmd($buildbugCmd, ['/bin/sh', '-c', $cmd]);
+		}  else  {
+		    $cmd = AppendToBashCmd($buildbugCmd, $cmd);
+		}
+	    }
+	    eval {PrintAndExecCmdAndFail($cmd)};
+	    $stopTs = GetCurTs();
+	    $dur = DiffTs($startTs, $stopTs);
+	    if (defined $buildbugCmd)  {
+		$@ = LogStatus('buildbug', '', $@ ne '', $dur, $@);
+	    }  else  {
+		$@ = LogStatus('build', 'no trace', $@ ne '', $dur, $@);
+	    }
+	    die $@ if $@ ne '';
+	    # stay in package build dir
+	}
+    };
+    my $savedErrs = $@;
+
+    eval {
+	DoChdir($homeDir);
+
+	my $extraConf .= "no-build-failures=$sourceCompilesFile\n" if defined $sourceCompilesFile;
+	ArchiveCreate('build', 'build', 'build-summary',
+			'build_summary.xml', $extraConf);
+    };
+    $savedErrs = AppendException($savedErrs, $@);
+
+    die $savedErrs if $savedErrs ne '';
+}
+
+
+sub DoUnpackBuild
+{
+}
+
+
+sub DoAssess
+{
+    ArchiveCreate('results', 'results', 'assessment-summary',
+			'assessment_summary.xml', undef);
+}
+
+
+sub DoUnpackResults
+{
+    my $resultsData = shift;
+
+    ArchiveExtract($resultsData, 'results-archive', 'results-unarchive');
+}
+
+
+sub DoParseResults
+{
+    my ($resultsDir, $assessmentSummaryFile) = @_;
+
+    my $resultParserConfFile = InFile('resultparser.conf');
+    my $resultParserData = ReadConfFile($resultParserConfFile);
+    my $resultParserDir = ConcatPaths($resultParserBaseDir, $resultParserData->{'result-parser-dir'});
+    my $resultParserCmd = ConcatPaths($resultParserDir, $resultParserData->{'result-parser-cmd'});
+
+    DoMkdir($resultParserBaseDir) if !-d $resultParserBaseDir;
+    DoChdir($resultParserBaseDir);
+    ArchiveExtract($resultParserData, 'result-parser-archive', 'resultparser-unarchive');
+    DoChdir($homeDir);
+
+    DoMkdir($parsedResultsBaseDir) if !-d $parsedResultsBaseDir;
+
+    DoChdir($resultsDir);
+
+    my %cmdEnv = %ENV;
+    $cmdEnv{PERL5LIB} = $resultParserDir;
+
+    my $weaknessCountFile = 'weaknesses.txt';
+    my @cmd = ($resultParserCmd,
+		    '--summary_file', $assessmentSummaryFile,
+		    '--output_dir', $parsedResultsBaseDir,
+		    '--output_file', 'parsed_results.xml',
+		    '--log_file', 'resultparser.log',
+		    '--weakness_count_file', $weaknessCountFile
+		    );
+
+    my ($startTs, $stopTs, $dur);
+    $startTs = GetCurTs();
+    eval {PrintAndExecCmdAndFail(\@cmd, \%cmdEnv)};
+    $stopTs = GetCurTs();
+    $dur = DiffTs($startTs, $stopTs);
+
+    my ($shortMsg, $state, $longMsg);
+    if ($@ eq '')  {
+	my $weaknessCountPath = ConcatPaths($parsedResultsBaseDir, $weaknessCountFile);
+	($shortMsg, $state, $longMsg) = ReadTaskInfoFile($weaknessCountPath);
+    }
+
+    # if the result parser FAILed, use the state and error for the long message
+    if ($@ ne '')  {
+	$state = $@ ne '';
+	$longMsg = $@;
+    }
+    $state = $@ ne '' unless defined $state;
+
+    $@ = LogStatus('parse-results', $shortMsg, $state, $dur, $longMsg);
+    my $savedErrs = $@;
+
+    eval {
+	DoChdir($homeDir);
+
+	ArchiveCreate('parsed_results', 'parsed-results', 'parsed-results',
+			'parsed_results.xml', undef);
+    };
+    $savedErrs = AppendException($savedErrs, $@);
+
+    die $savedErrs if $savedErrs ne '';
+}
+
+
+sub ApplyOsDependencies
+{
+    my ($confFile, $options) = @_;
+    my $cAssessOptions = $options->{'#c-assess-options'};
+
+    my ($sysType, $pkgInstallInit, $pkgInstallCmd, $validExits) = GetPlatformParams($options);
+    $validExits = [] unless defined $validExits;
+
+    return '--no-sys-deps flag' if $options->{'no-sys-deps'};
+    return 'none' unless -f $confFile;
+    return 'internet inaccessible' if $options->{'internet-inaccessible'};
+
+    if (HasValue $cAssessOptions->{'install-dependencies-cmd'})  {
+	my %validExits = map {/(\d+):(.*)/; $1 => $2} split /\s*;\s*/, $validExits;
+	my @validExits = keys %validExits;
+	my $cmd = "$pkgInstallCmd $confFile";
+	my ($exitCode) = PrintAndExecCmdAndFail($cmd, undef, undef, undef, undef, \@validExits);
+	return exists $validExits{$exitCode} ? $validExits{$exitCode} : '';
+    }  else  {
+	my $data = ReadConfFile($confFile);
+	my $k = "dependencies-$sysType";
+
+	return 'none' unless exists $data->{$k};
+	my $dependencies = $data->{$k};
+	return 'none' if $dependencies =~ /^\s*$/;
+
+	PrintAndExecCmdAndFail($pkgInstallInit) if defined $pkgInstallInit;
+
+	die "Error: --os-pkg-install-cmd not defined and OS packages need installation"
+		unless defined $pkgInstallCmd;
+
+	$pkgInstallCmd = AppendToBashCmd($pkgInstallCmd, $dependencies);
+	PrintAndExecCmdAndFail($pkgInstallCmd);
+
+	return '';
+    }
+}
+
+
+sub PrependToEnv
+{
+    my ($e, $v) = @_;
+
+    $v .= ":$ENV{$e}" if exists $ENV{$e};
+
+    $ENV{$e} = $v;
+    LogIt("export $e=" . BashQuote($v));
+}
+
+
+sub InstallComponent
+{
+    my ($component, $componentData, $confFile) = @_;
+
+    die "Component '$component' key not found in $confFile" unless exists $componentData->{$component};
+
+    my $conf = InFile($componentData->{$component});
+    my $compData = ReadConfFile($conf);
+    my $compArchive = $compData->{'component-archive'};
+    my $compBaseDir = $compData->{'component-base-dir'};
+
+    if (HasValue $compArchive)  {
+	die "component-install-dir not defined in '$conf' file" unless HasValue $compBaseDir;
+	DoMkdirP($compBaseDir);
+	DoChdir($compBaseDir);
+	ArchiveExtract($compData, 'component-archive', "${component}-unarchive");
+	DoChdir($homeDir);
+    }
+
+    my $compInstallCmd = $compData->{'component-install-cmd'};
+    my $compInstallOpt = $compData->{'component-install-opt'};
+    if (HasValue $compInstallCmd)  {
+	my $cmd = BashCmdStringToArray($compInstallCmd);
+	$cmd = AppendToBashCmd($cmd, $compInstallOpt) if HasValue $compInstallOpt;
+	$cmd = BashCmdToStringIfSetEnv($cmd);
+	my $startTs = GetCurTs();
+	eval {
+	    DoChdir($compBaseDir);
+	    PrintAndExecCmdAndFail($cmd, undef, undef, undef, undef);
+	};
+	my $stopTs = GetCurTs();
+	my $dur = DiffTs($startTs, $stopTs);
+	$@ = LogStatus("${component}-install", '', $@ ne '', $dur, $@);
+	DoChdir($homeDir);
+	die $@ if $@ ne '';
+    }
+
+    my $compBinDir			= $compData->{'component-bin-dir'};
+    my $compLibraryPath			= $compData->{'component-library-path'};
+    my $compPrependBinToEnv		= $compData->{'component-prepend-bin-to-env'};
+    my $compPrependLibraryPathToEnv	= $compData->{'component-prepend-library-path-to-env'};
+    
+    if (HasValue($compBinDir) && HasValue($compPrependBinToEnv))  {
+	foreach my $e (split ' ', $compPrependBinToEnv)  {
+	    PrependToEnv($e, $compBinDir);
+	}
+    }
+    
+    if (HasValue($compLibraryPath) && HasValue($compPrependLibraryPathToEnv))  {
+	foreach my $e (split ' ', $compPrependLibraryPathToEnv)  {
+	    PrependToEnv($e, $compLibraryPath);
+	}
+    }
+}
+
+
+sub InstallComponents
+{
+    my ($confFile) = @_;
+
+    my $componentData = ReadConfFile($confFile);
+
+    return "no components key in $confFile" unless exists $componentData->{components};
+
+    my $components = $componentData->{components};
+    my @components = split ' ', $components;
+    return 'none' unless @components;
+
+    foreach my $component (@components)  {
+	InstallComponent($component, $componentData);
+    }
+
+    return '';
+}
+
+
+sub InstallStrace
+{
+    my ($options) = @_;
+    my $cAssess = $options{'#c-assess-options'};
+
+    my $installKey = 'strace-install-cmd';
+    my $straceCmdKey = 'strace-cmd';
+    my $confFile = $cAssess->{'#filenameofconffile'};
+
+    return (-1, "$confFile not found") unless -f $confFile;
+
+    return (-1, "$installKey not found in $confFile") unless exists $cAssess->{$installKey};
+    return (-1, "$straceCmdKey not found in $confFile") unless exists $cAssess->{$straceCmdKey};
+
+    return (-1, "in-dir not defined") unless HasValue $options->{'in-dir'};
+    return (-1, "plat-name not defined") unless HasValue $options->{'plat-name'};
+
+    $cAssess->{'swamp-in-dir'} = $options->{'in-dir'};
+    $cAssess->{'swamp-plat-name'} = $options->{'plat-name'};
+
+    my $installCmd = EvalHashValue($installKey, $cAssess);
+    return (-1, "$installKey evals empty in $confFile") unless HasValue $installCmd;
+
+    my $straceCmd = EvalHashValue($straceCmdKey, $cAssess);
+    return (-1, "$straceCmdKey evals empty in $confFile") unless HasValue $straceCmd;
+
+    PrintAndExecCmdAndFail($installCmd);
+
+    return (-1, "$straceCmd not found") unless -f $straceCmd;
+    return (-1, "$straceCmd not executable") unless -x $straceCmd;
+
+    return (0, $straceCmd);
+}
+
+
+sub DoRun
+{
+    my $options = shift;
+
+    my $runConfFile = InFile('run.conf');
+    my $runData = ReadConfFile($runConfFile);
+
+    die "Error: no 'goal' key found in $runConfFile" unless exists $runData->{goal};
+    my $goal = $runData->{goal};
+    my $goalFrom = $runConfFile;
+    if (defined $options->{goal})  {
+	$goal = $options->{goal};
+	$goalFrom = '--goal';
+    }
+    die "Invalid 'goal' value '$goal' in $goalFrom"
+	    unless $goal =~ /^(none|build|build\+assess|build\+assess\+parse|assess|assess\+parse|parse|just-build)$/;
+    $options->{'internet-inaccessible'} = BoolValue $runData->{'internet-inaccessible'};
+    my $buildIt = ($goal =~ /build/);
+    my $assessIt = ($goal =~ /assess/);
+    my $parseIt = ($goal =~ /parse/);
+    my $justBuildIt = ($goal eq 'just-build');
+
+    my $osDependenciesFile = InFile('os-dependencies.conf');
+    my $cAssessConf = InFile('c-assess.conf');
+    my $cAssessOptions = {'#filenameofconffile' => $cAssessConf};
+    $cAssessOptions = ReadConfFile $cAssessConf if -f $cAssessConf;
+    $options->{'#c-assess-options'} = $cAssessOptions;
+    my $componentsFile = InFile('components.conf');
+    my $buildbugFile = InFile('buildbug');
+    my $buildbugStraceFile = BuildFile('strace.out');
+    my $buildbugBuildSummaryFile = BuildFile('build_summary.xml');
+    my $buildbugStdout = BuildFile('build_stdout.out');
+    my $buildbugStderr = BuildFile('build_stderr.out');
+    my $buildbugDebug = BuildFile('buildbug.out');
+
+    my $startTs = GetCurTs();
+    my $r = eval {ApplyOsDependencies($osDependenciesFile, $options)};
+    my $stopTs = GetCurTs();
+    my $dur = DiffTs($startTs, $stopTs);
+    my $status = ($@ ? 1 : (HasValue($r) ? -1 : 0));
+    $@ = LogStatus('install-os-dependencies', $r, $status, $dur, $@);
+    LogStatus('retry', '', -2, undef, '') if $status == 1;
+    die $@ if $@ ne '';
+
+    my $buildbugCmd = [
+			$buildbugFile,
+			"--strace=$buildbugStraceFile",
+			"--stdout=$buildbugStdout",
+			"--stderr=$buildbugStderr",
+			"--debuginfo=$buildbugDebug",
+			"--buildsummary=$buildbugBuildSummaryFile",
+			"--status=$statusFile"
+		    ];
+    my $platName = $options->{'plat-name'};
+    push @$buildbugCmd, "--plat-name=$platName" if defined $platName;
+    my $platUuid = $options->{'plat-uuid'};
+    push @$buildbugCmd, "--plat-uuid=$platUuid" if defined $platUuid;
+
+    if (-f $componentsFile)  {
+	my $startTs = GetCurTs();
+	my $r = eval {InstallComponents($componentsFile, $options)};
+	my $stopTs = GetCurTs();
+	my $dur = DiffTs($startTs, $stopTs);
+	my $status = ($@ ? 1 : (HasValue($r) ? -1 : 0));
+	$@ = LogStatus('install-components', $r, $status, $dur, $@);
+	die $@ if $@ ne '';
+    }
+
+    if ($buildIt && !$justBuildIt)  {
+	$startTs = GetCurTs();
+	my $msg = '';
+	($r, $msg) = eval {InstallStrace($options)};
+	$stopTs = GetCurTs();
+	$dur = DiffTs($startTs, $stopTs);
+	$status = $@ ? 1 : $r;
+	$@ = LogStatus('install-strace', $msg, $status, $dur, $@);
+	die $@ if $@ ne '';
+	if ($r == 0)  {
+	    $buildbugCmd = AppendToBashCmd($buildbugCmd, "--stracebin=$msg");
+	}
+    }
+
+    my $savedErrs = '';
+    if ($assessIt)  {
+	my $extraBuildbugOpts = eval {DoPreAssess()};
+	$@ = LogStatus('misc', 'DoPreAssess', 1, undef, $@) if (ShouldStatusLog($@));
+	die $@ if $@ ne '';
+	$buildbugCmd = AppendToBashCmd($buildbugCmd, $extraBuildbugOpts);
+    }
+    if ($buildIt)  {
+	if ($justBuildIt)  {
+	    $buildbugCmd = undef;
+	}
+
+	my $pkgConfFile = InFile('package.conf');
+	my $pkgData = ReadConfFile($pkgConfFile);
+	my $pkgName = $pkgData->{'package-short-name'};
+	$buildbugCmd = AppendToBashCmd($buildbugCmd, "--pkg-name=$pkgName") if defined $pkgName;
+	my $pkgVersion = $pkgData->{'package-version'};
+	$buildbugCmd = AppendToBashCmd($buildbugCmd, "--pkg-version=$pkgVersion") if defined $pkgVersion;
+	my $configureStdout = BuildFile('configure_stdout.out');
+	my $configureStderr = BuildFile('configure_stderr.out');
+	# DoBuild also does assess for now.
+	eval {DoBuild($pkgData, $buildbugCmd, $configureStdout, $configureStderr)};
+	if (ShouldStatusLog($@))  {
+	    $@ = LogStatus('misc', 'DoBuild', 1, undef, $@);
+	}
+	$savedErrs = $@;
+    }
+    # since buildbug performs build and assess, the failure could have been
+    # in the assess, so always call DoAssess to tar results dir for debugging
+    #
+    # if ($assessIt && $savedErrs eq '')  {
+    if ($assessIt)  {
+	if (!$buildIt)  {
+	    die "'goal' value '$goal' not supported";
+	    my $buildData = ReadConfFile(InFile('build.conf'));
+	    eval {DoUnpackBuild($buildData)};
+	    if (ShouldStatusLog($@))  {
+		$@ = LogStatus('misc', 'DoUnpackBuild', 1, undef, $@);
+	    }
+	    $savedErrs = AppendException($savedErrs, $@);
+	}
+
+	# DoBuild does assess for now, except archiving.
+	eval {DoAssess()};
+	if (ShouldStatusLog($@))  {
+	    $@ = LogStatus('misc', '', 1, undef, $@);
+	}
+	$savedErrs = AppendException($savedErrs, $@);
+    }
+    if ($parseIt && $savedErrs eq '')  {
+	my ($resultsDir, $assessmentSummaryFile) = ($resultsBaseDir, 'assessment_summary.xml');
+	if (!$assessIt)  {
+	    my $resultsConfFile = InFile('results.conf');
+	    my $resultsData = ReadConfFile($resultsConfFile);
+	    eval {DoUnpackResults($resultsData)};
+	    if (ShouldStatusLog($@))  {
+		$@ = LogStatus('misc', '', 1, undef, $@);
+	    }
+	    $savedErrs = AppendException($savedErrs, $@);
+
+	    $resultsDir = HomeFile($resultsData->{'results-dir'});
+	    $assessmentSummaryFile = $resultsData->{'assessment-summary-file'};
+	}
+
+	if ($savedErrs eq '')  {
+	    eval {DoParseResults($resultsDir, $assessmentSummaryFile)};
+	    if (ShouldStatusLog($@))  {
+		$@ = LogStatus('misc', '', 1, undef, $@);
+	    }
+	    $savedErrs = AppendException($savedErrs, $@);
+	}
+    }
+
+    die $savedErrs if $savedErrs ne '';
+}
+
+
+my $dur;
+my $startTs = GetCurTs();
+
+eval {
+    ProcessOptions();
+    $statusFile = OutFile('status.out');
+    LogStatus('begin', '', -2, undef, '');
+    eval {DoRun(\%options)};
+    $@ = LogStatus('misc', 'DoRun', $@ ne '', undef, $@) if ShouldStatusLog($@);
+    die $@ if $@ ne '';
+};
+
+my $stopTs = GetCurTs();
+$dur = DiffTs($startTs, $stopTs);
+
+LogStatus('all', '', $@ ne '', $dur, $@);
+LogStatus('end', '', -2, undef, '');
+
+if ($@ ne '')  {
+    die RestoreStatusLogMsg($@);
+}
