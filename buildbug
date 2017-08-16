@@ -26,7 +26,11 @@ use Cwd;
 use Time::HiRes qw( gettimeofday );
 use Data::Dumper;
 
-my $buildBugVersion = '1.1.7 (Apr 10, 2017)';
+my $buildBugVersion = '1.1.8 (Aug 04, 2017)';
+my $fwName = 'c-assess';
+my $fwVersion = $buildBugVersion;
+$fwVersion =~ s/ .*$//;
+
 my %options;
 my $statusFile;
 
@@ -2493,11 +2497,61 @@ sub PrintBuildXml
     print $outFH XmlElem('platform-uuid', $data->{platUuid}, $eIndent);
     print $outFH XmlElem('package-name', $data->{pkgName}, $eIndent);
     print $outFH XmlElem('package-version', $data->{pkgVersion}, $eIndent);
+    print $outFH XmlElem('build-fw', $data->{buildFw}, $eIndent);
+    print $outFH XmlElem('build-fw-version', $data->{buildFwVersion}, $eIndent);
     PrintExecsXml($outFH, $data->{execs}, $eIndent);
     print $outFH XmlBuildEids($data, $eIndent);
     PrintBuildActionsXml($outFH, $data->{buildActions}, $eIndent);
     PrintCmdsAttrsXml($outFH, $data->{cmdInfo}, $eIndent);
     print $outFH XmlCloseTag('build', $indent);
+}
+
+
+sub PrintAssessmentSummaryHeaderXml
+{
+    my ($outFH, $indent, $data, $toolConf, $uuid) = @_;
+
+    my $toolVersion;
+    if (defined $toolConf->{'tool-version'})  {
+	$toolVersion = $toolConf->{'tool-version'};
+    }  elsif (defined $toolConf->{'#toolVersionText'})  {
+	$toolVersion = $toolConf->{'#toolVersionText'};
+    }
+
+    print $outFH XmlDecl('1.0', 'utf-8', $indent);
+    print $outFH XmlOpenTag('assessment-summary', $indent);
+
+    ++$indent if defined $indent;
+
+    print $outFH XmlElem('assessment-summary-uuid', $uuid, $indent);
+    print $outFH XmlElem('build-summary-uuid', $data->{uuid}, $indent);
+    print $outFH XmlElem('build-root-dir', $data->{buildRootDir}, $indent);
+    print $outFH XmlElem('package-root-dir', $data->{packageRootDir}, $indent);
+    print $outFH XmlElem('platform-name', $data->{platName}, $indent);
+    print $outFH XmlElem('platform-uuid', $data->{platUuid}, $indent);
+    print $outFH XmlElem('package-name', $data->{pkgName}, $indent);
+    print $outFH XmlElem('package-version', $data->{pkgVersion}, $indent);
+    print $outFH XmlElem('tool-type', $toolConf->{'tool-type'}, $indent);
+    print $outFH XmlElem('tool-version', $toolVersion, $indent);
+    print $outFH XmlElem('build-fw', $data->{buildFw}, $indent);
+    print $outFH XmlElem('build-fw-version', $data->{buildFwVersion}, $indent);
+    print $outFH XmlElem('assess-fw', $data->{assessFw}, $indent);
+    print $outFH XmlElem('assess-fw-version', $data->{assessFwVersion}, $indent);
+    print $outFH XmlOpenTag('assessment-artifacts', $indent);
+}
+
+
+sub PrintAssessmentSummaryFooterXml
+{
+    my ($outFH, $indent, $assessStartTs, $assessStopTs) = @_;
+
+    my $indent1; 
+    $indent1 = $indent + 1 if defined $indent;
+
+    print $outFH XmlCloseTag('assessment-artifacts', $indent1);
+    print $outFH XmlElem('start-ts', $assessStartTs, $indent1);
+    print $outFH XmlElem('stop-ts', $assessStopTs, $indent1);
+    print $outFH XmlCloseTag('assessment-summary', $indent);
 }
 
 
@@ -3157,28 +3211,16 @@ sub DoMetricAssessment
     }
     close TOOLVER or die "close $toolPath --version|: $!";
     chomp $toolVersion;
+    $toolConf->{'#toolVersionText'} = $toolVersion;
 
     my $asFile = "$resultsDir/assessment_summary.xml";
-    open ASFILE, ">", $asFile or die "open $asFile: $!";
+    open my $asFH, ">", $asFile or die "open $asFile: $!";
+
     my $indent = 0;
-    my ($indent1, $indent2);
-    if (defined $indent)  {
-	$indent1 = $indent + 1;
-	$indent2 = $indent1 + 1;
-    }
-    print ASFILE XmlDecl('1.0', 'utf-8', $indent);
-    print ASFILE XmlOpenTag('assessment-summary', $indent);
-    print ASFILE XmlElem('assessment-summary-uuid', $uuid, $indent1);
-    print ASFILE XmlElem('build-summary-uuid', $data->{uuid}, $indent1);
-    print ASFILE XmlElem('build-root-dir', $data->{buildRootDir}, $indent1);
-    print ASFILE XmlElem('package-root-dir', $data->{packageRootDir}, $indent1);
-    print ASFILE XmlElem('platform-name', $data->{platName}, $indent1);
-    print ASFILE XmlElem('platform-uuid', $data->{platUuid}, $indent1);
-    print ASFILE XmlElem('package-name', $data->{pkgName}, $indent1);
-    print ASFILE XmlElem('package-version', $data->{pkgVersion}, $indent1);
-    print ASFILE XmlElem('tool-type', $toolType, $indent1);
-    print ASFILE XmlElem('tool-version', $toolVersion, $indent1);
-    print ASFILE XmlOpenTag('assessment-artifacts', $indent1);
+    my $indent2;
+    $indent2 = $indent + 2 if defined $indent;
+
+    PrintAssessmentSummaryHeaderXml($asFH, $indent, $data, $toolConf, $uuid);
 
     my %files;
     for my $a (@{$data->{buildActions}})  {
@@ -3272,18 +3314,16 @@ sub DoMetricAssessment
 	    ++$fail;
 	    print STDERR "# Error: ", GetExecErrorMsg(\@cmd, $exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus), "\n";
 	}
-	print ASFILE XmlAssessment($cmd[0], \@cmd, \%myEnv, $pkgPath,
+	print $asFH XmlAssessment($cmd[0], \@cmd, \%myEnv, $pkgPath,
 		$reportFileName, $stdoutFileName, $stderrFileName, $id,
 		$exitCode, $exitSignalName, $startTs, $stopTs, $indent2);
     }
 
     my $assessStopTs = GetCurTs();
 
-    print ASFILE XmlCloseTag('assessment-artifacts', $indent1);
-    print ASFILE XmlElem('start-ts', $assessStartTs, $indent1);
-    print ASFILE XmlElem('stop-ts', $assessStopTs, $indent1);
-    print ASFILE XmlCloseTag('assessment-summary', $indent);
-    close ASFILE or die "close $asFile: $!";
+    PrintAssessmentSummaryFooterXml($asFH, $indent, $assessStartTs, $assessStopTs);
+
+    close $asFH or die "close $asFile: $!";
 
     return ($pass, $fail, $skip);
 }
@@ -3324,28 +3364,16 @@ sub DoCppcheckAssessment
     }
     close TOOLVER or die "close $toolPath --version|: $!";
     chomp $toolVersion;
+    $toolConf->{'#toolVersionText'} = $toolVersion;
 
     my $asFile = "$resultsDir/assessment_summary.xml";
-    open ASFILE, ">", $asFile or die "open $asFile: $!";
+    open my $asFH, ">", $asFile or die "open $asFile: $!";
+
     my $indent = 0;
-    my ($indent1, $indent2);
-    if (defined $indent)  {
-	$indent1 = $indent + 1;
-	$indent2 = $indent1 + 1;
-    }
-    print ASFILE XmlDecl('1.0', 'utf-8', $indent);
-    print ASFILE XmlOpenTag('assessment-summary', $indent);
-    print ASFILE XmlElem('assessment-summary-uuid', $uuid, $indent1);
-    print ASFILE XmlElem('build-summary-uuid', $data->{uuid}, $indent1);
-    print ASFILE XmlElem('build-root-dir', $data->{buildRootDir}, $indent1);
-    print ASFILE XmlElem('package-root-dir', $data->{packageRootDir}, $indent1);
-    print ASFILE XmlElem('platform-name', $data->{platName}, $indent1);
-    print ASFILE XmlElem('platform-uuid', $data->{platUuid}, $indent1);
-    print ASFILE XmlElem('package-name', $data->{pkgName}, $indent1);
-    print ASFILE XmlElem('package-version', $data->{pkgVersion}, $indent1);
-    print ASFILE XmlElem('tool-type', $toolType, $indent1);
-    print ASFILE XmlElem('tool-version', $toolVersion, $indent1);
-    print ASFILE XmlOpenTag('assessment-artifacts', $indent1);
+    my $indent2;
+    $indent2 = $indent + 2 if defined $indent;
+
+    PrintAssessmentSummaryHeaderXml($asFH, $indent, $data, $toolConf, $uuid);
 
     for my $a (@{$data->{buildActions}})  {
 	my $op = $a->{op};
@@ -3406,18 +3434,16 @@ sub DoCppcheckAssessment
 	    ++$fail;
 	    print STDERR "# Error: ", GetExecErrorMsg(\@cmd, $exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus), "\n";
 	}
-	print ASFILE XmlAssessment($cmd[0], \@cmd, $env, $cwd, $resultFileName, undef, undef, $id,
+	print $asFH XmlAssessment($cmd[0], \@cmd, $env, $cwd, $resultFileName, undef, undef, $id,
 	    $exitCode, $exitSignalName, $startTs, $stopTs, $indent2);
     }
 
     chdir $savedCwd or die "chdir $savedCwd: $!";
     my $assessStopTs = GetCurTs();
 
-    print ASFILE XmlCloseTag('assessment-artifacts', $indent1);
-    print ASFILE XmlElem('start-ts', $assessStartTs, $indent1);
-    print ASFILE XmlElem('stop-ts', $assessStopTs, $indent1);
-    print ASFILE XmlCloseTag('assessment-summary', $indent);
-    close ASFILE or die "close $asFile: $!";
+    PrintAssessmentSummaryFooterXml($asFH, $indent, $assessStartTs, $assessStopTs);
+
+    close $asFH or die "close $asFile: $!";
 
     return ($pass, $fail, $skip);
 }
@@ -3646,6 +3672,7 @@ sub DoClangSaAssessment
     my $buildRootDir = $data->{buildRootDir};
     my $toolVersion = '';
     my $id = 0;
+    my $toolConf = ReadConfFile($toolConfFile);
 
     my $clangPath = "$toolDir/bin/clang";
     open TOOLVER, "$clangPath -v 2>&1 |" or die "open $clangPath -v |: $!";
@@ -3654,28 +3681,16 @@ sub DoClangSaAssessment
     }
     close TOOLVER or die "close $toolPath --version|: $!";
     chomp $toolVersion;
+    $toolConf->{'#toolVersionText'} = $toolVersion;
 
     my $asFile = "$resultsDir/assessment_summary.xml";
-    open ASFILE, ">", $asFile or die "open $asFile: $!";
+    open my $asFH, ">", $asFile or die "open $asFile: $!";
+
     my $indent = 0;
-    my ($indent1, $indent2);
-    if (defined $indent)  {
-	$indent1 = $indent + 1;
-	$indent2 = $indent1 + 1;
-    }
-    print ASFILE XmlDecl('1.0', 'utf-8', $indent);
-    print ASFILE XmlOpenTag('assessment-summary', $indent);
-    print ASFILE XmlElem('assessment-summary-uuid', $uuid, $indent1);
-    print ASFILE XmlElem('build-summary-uuid', $data->{uuid}, $indent1);
-    print ASFILE XmlElem('build-root-dir', $buildRootDir, $indent1);
-    print ASFILE XmlElem('package-root-dir', $data->{packageRootDir}, $indent1);
-    print ASFILE XmlElem('platform-name', $data->{platName}, $indent1);
-    print ASFILE XmlElem('platform-uuid', $data->{platUuid}, $indent1);
-    print ASFILE XmlElem('package-name', $data->{pkgName}, $indent1);
-    print ASFILE XmlElem('package-version', $data->{pkgVersion}, $indent1);
-    print ASFILE XmlElem('tool-type', $toolType, $indent1);
-    print ASFILE XmlElem('tool-version', $toolVersion, $indent1);
-    print ASFILE XmlOpenTag('assessment-artifacts', $indent1);
+    my $indent2;
+    $indent2 = $indent + 2 if defined $indent;
+
+    PrintAssessmentSummaryHeaderXml($asFH, $indent, $data, $toolConf, $uuid);
 
     chdir $buildRootDir;
 
@@ -3724,7 +3739,7 @@ sub DoClangSaAssessment
     die "ERROR in DoCLangSaAssessment: no directory found in clang output directory ($outputDir)"
 	    unless $pass == 0 || defined $resultFileName;
 
-    print ASFILE XmlAssessment($cmd[0], \@cmd, \%ENV, $buildRootDir,
+    print $asFH XmlAssessment($cmd[0], \@cmd, \%ENV, $buildRootDir,
 				$resultFileName, $stdoutFileName, $stderrFileName, $id,
 				$exitCode, $exitSignalName, $startTs, $stopTs, $indent2);
 
@@ -3732,11 +3747,10 @@ sub DoClangSaAssessment
 
     chdir $savedCwd;
 
-    print ASFILE XmlCloseTag('assessment-artifacts', $indent1);
-    print ASFILE XmlElem('start-ts', $assessStartTs, $indent1);
-    print ASFILE XmlElem('stop-ts', $assessStopTs, $indent1);
-    print ASFILE XmlCloseTag('assessment-summary', $indent);
-    close ASFILE or die "close $asFile: $!";
+    PrintAssessmentSummaryFooterXml($asFH, $indent, $assessStartTs, $assessStopTs);
+
+    close $asFH or die "close $asFile: $!";
+
     return ($pass, $fail, $skip);
 }
 
@@ -3747,7 +3761,7 @@ sub DoClangSaAssessment
 
 sub DoGccWarnAssessment
 {
-    my ($data, $toolType, $resultsDir, $toolPath, $toolOpt) = @_;
+    my ($data, $toolType, $resultsDir, $toolPath, $toolOpt, $toolConfFile) = @_;
     my ($pass, $fail, $skip) = (0, 0);
     my $uuid = GetUuid();
     my $id = 0;
@@ -3756,6 +3770,7 @@ sub DoGccWarnAssessment
     my $toolVersion;
     my $gccPath = $toolPath;
     my %warns;
+    my $toolConf = ReadConfFile($toolConfFile);
 
     for my $a (@{$data->{buildActions}})  {
 	my $op = $a->{op};
@@ -3771,28 +3786,16 @@ sub DoGccWarnAssessment
 	    $toolVersion = $ver;
 	}
     }
+    $toolConf->{'#toolVersionText'} = $toolVersion;
 
     my $asFile = "$resultsDir/assessment_summary.xml";
-    open ASFILE, ">", $asFile or die "open $asFile: $!";
+    open my $asFH, ">", $asFile or die "open $asFile: $!";
+
     my $indent = 0;
-    my ($indent1, $indent2);
-    if (defined $indent)  {
-	$indent1 = $indent + 1;
-	$indent2 = $indent1 + 1;
-    }
-    print ASFILE XmlDecl('1.0', 'utf-8', $indent);
-    print ASFILE XmlOpenTag('assessment-summary', $indent);
-    print ASFILE XmlElem('assessment-summary-uuid', $uuid, $indent1);
-    print ASFILE XmlElem('build-summary-uuid', $data->{uuid}, $indent1);
-    print ASFILE XmlElem('build-root-dir', $data->{buildRootDir}, $indent1);
-    print ASFILE XmlElem('package-root-dir', $data->{packageRootDir}, $indent1);
-    print ASFILE XmlElem('platform-name', $data->{platName}, $indent1);
-    print ASFILE XmlElem('platform-uuid', $data->{platUuid}, $indent1);
-    print ASFILE XmlElem('package-name', $data->{pkgName}, $indent1);
-    print ASFILE XmlElem('package-version', $data->{pkgVersion}, $indent1);
-    print ASFILE XmlElem('tool-type', $toolType, $indent1);
-    print ASFILE XmlElem('tool-version', $toolVersion, $indent1);
-    print ASFILE XmlOpenTag('assessment-artifacts', $indent1);
+    my $indent2;
+    $indent2 = $indent + 2 if defined $indent;
+
+    PrintAssessmentSummaryHeaderXml($asFH, $indent, $data, $toolConf, $uuid);
 
     for my $a (@{$data->{buildActions}})  {
 	my $op = $a->{op};
@@ -3860,18 +3863,16 @@ sub DoGccWarnAssessment
 		    GetExecErrorMsg(\@cmd, $exitCode, $exitSignal, $exitSignalName,
 			    $exitErrnoMsg, $exitStatus), "\n";
 	}
-	print ASFILE XmlAssessment($cmd[0], \@cmd, $env, $cwd, $resultFileName, undef, undef, $id,
+	print $asFH XmlAssessment($cmd[0], \@cmd, $env, $cwd, $resultFileName, undef, undef, $id,
 	    $exitCode, $exitSignalName, $startTs, $stopTs, $indent2);
     }
 
     chdir $savedCwd or die "chdir $savedCwd: $!";
     my $assessStopTs = GetCurTs();
 
-    print ASFILE XmlCloseTag('assessment-artifacts', $indent1);
-    print ASFILE XmlElem('start-ts', $assessStartTs, $indent1);
-    print ASFILE XmlElem('stop-ts', $assessStopTs, $indent1);
-    print ASFILE XmlCloseTag('assessment-summary', $indent);
-    close ASFILE or die "close $asFile: $!";
+    PrintAssessmentSummaryFooterXml($asFH, $indent, $assessStartTs, $assessStopTs);
+
+    close $asFH or die "close $asFile: $!";
 
     return ($pass, $fail, $skip);
 }
@@ -3881,12 +3882,12 @@ sub DoGccWarnAssessment
 ########################## Parasoft Ctest ###########################
 
 
-sub GetBashCpptestscanCmds
+sub BashCmdsForBuildCmd
 {
-    my ($e, $prevDir, $prevEnv, $cpptestscanCmd) = @_;
+    my ($e, $prevDir, $prevEnv, $funcName, $allowedExecTypes) = @_;
     my $buildExecType = $e->{buildInfo}{buildExecType};
 
-    if ($buildExecType eq 'gcc' || $buildExecType eq 'g++')  {
+    if (!defined $allowedExecTypes || $allowedExecTypes->{$buildExecType})  {
 	my $s = '';
 	my $dir = $e->{startCwd};
 	my $env = $e->{startEnv};
@@ -3908,11 +3909,80 @@ sub GetBashCpptestscanCmds
 
 	$s .= "cd " . BashQuote($dir) . "\n\n" unless $dir eq $prevDir;
 
-	$s .= "$cpptestscanCmd " . GetCmdString($args) . "\n";
+	$s .= "$funcName " . GetCmdString($args) . "\n";
 
 	return ($s, $dir, $env);
     }  else  {
 	return (undef, $prevDir, $prevEnv);
+    }
+}
+
+
+sub WriteAssessCmdsFile
+{
+    my ($data, $BUILDFILE, $funcName, $funcArgs, $allowedExecTypes, $prefixCmds) = @_;
+
+    my $funcCmd = GetCmdString($funcArgs);
+    $prefixCmds = '' unless defined $prefixCmds;
+
+    print $BUILDFILE <<EOF;
+#!/bin/bash
+
+set -e
+set -x
+
+$prefixCmds
+
+function $funcName()  {
+    $funcCmd "\$\@"
+}
+
+EOF
+
+    my ($prevDir, $prevEnv) = ('', \%ENV);
+    my $eids = $data->{eids};
+    foreach my $eid (@{$data->{buildEids}})  {
+	my $e = $eids->{$eid};
+	my $buildExecType = $e->{buildInfo}{buildExecType};
+	next if defined $allowedExecTypes && !exists $allowedExecTypes->{$buildExecType};
+
+	my $startCwd = $e->{startCwd};
+	next unless -d $startCwd;
+
+	my $atLeastOneFile = 0;
+	my @missingFiles = ();
+	my $bi = $e->{buildInfo};
+	next if !exists $bi->{op} || $bi->{op} eq 'diagnostic';
+	foreach my $file (@{$bi->{files}})  {
+	    $atLeastOneFile = 1;
+	    my $type = $bi->{fileTypes}{$file};
+	    next if $type eq 'l' && $file =~ /^-l/;
+	    push @missingFiles, $file unless -f MakeAbsPath($startCwd, $file);
+	}
+	if (exists $bi->{T})  {
+	    my $file = $bi->{T};
+	    push @missingFiles, $file unless -f MakeAbsPath($startCwd, $file);
+	}
+
+	my ($s, $newDir, $newEnv)
+		= BashCmdsForBuildCmd($e, $prevDir, $prevEnv, $funcName, $allowedExecTypes);
+
+	if (defined $s)  {
+	    my $errorMsg = '';
+	    if (!$atLeastOneFile)  {
+		$errorMsg = "# No input files to command, skipping:\n";
+	    }
+	    if (@missingFiles)  {
+		my $missingFiles = join(', ', @missingFiles);
+		$errorMsg = "# Files not found ($missingFiles), skipping:\n" ;
+	    }
+	    if ($errorMsg eq '')  {
+		($prevDir, $prevEnv) = ($newDir, $newEnv)
+	    }  else  {
+		$s =~ s/^/#  /mg;
+	    }
+	    print $BUILDFILE "\n# eid=$eid\n$errorMsg$s"
+	}
     }
 }
 
@@ -3947,6 +4017,8 @@ sub WriteCpptestAssessCmdsFile
 	}
     }
 
+    open my $BUILDFILE, ">$filename" or die "open $filename: $!";
+
     my $cpptestscanFunc = "Cpptestscan";
     my @cpptestscanCmd = (
 			    $cpptestscanCmdPath,
@@ -3954,66 +4026,9 @@ sub WriteCpptestAssessCmdsFile
 			    "--cpptestscanProjectName=$projName",
 			    "--cpptestscanRunOrigCmd=no"
 			);
-    my $cpptestscanCmd = GetCmdString(\@cpptestscanCmd);
 
-    open BUILDFILE, ">$filename" or die "open $filename: $!";
-
-    print BUILDFILE <<EOF;
-#!/bin/bash
-
-set -e
-set -x
-
-function $cpptestscanFunc()  {
-    $cpptestscanCmd "\$\@"
-}
-
-EOF
-
-    my ($prevDir, $prevEnv) = ('', \%ENV);
-    foreach my $eid (@{$data->{buildEids}})  {
-	my $e = $eids->{$eid};
-	my $buildExecType = $e->{buildInfo}{buildExecType};
-	next unless $buildExecType eq 'gcc' || $buildExecType eq 'g++';
-
-	my $startCwd = $e->{startCwd};
-	next unless -d $startCwd;
-
-	my $atLeastOneFile = 0;
-	my @missingFiles = ();
-	my $bi = $e->{buildInfo};
-	next if $bi->{op} eq 'diagnostic';
-	foreach my $file (@{$bi->{files}})  {
-	    $atLeastOneFile = 1;
-	    my $type = $bi->{fileTypes}{$file};
-	    next if $type eq 'l' && $file =~ /^-l/;
-	    push @missingFiles, $file unless -f MakeAbsPath($startCwd, $file);
-	}
-	if (exists $bi->{T})  {
-	    my $file = $bi->{T};
-	    push @missingFiles, $file unless -f MakeAbsPath($startCwd, $file);
-	}
-
-	my ($s, $newDir, $newEnv)
-		= GetBashCpptestscanCmds($e, $prevDir, $prevEnv, $cpptestscanFunc);
-
-	if (defined $s)  {
-	    my $errorMsg = '';
-	    if (!$atLeastOneFile)  {
-		$errorMsg = "# No input files to command, skipping:\n";
-	    }
-	    if (@missingFiles)  {
-		my $missingFiles = join(', ', @missingFiles);
-		$errorMsg = "# Files not found ($missingFiles), skipping:\n" ;
-	    }
-	    if ($errorMsg eq '')  {
-		($prevDir, $prevEnv) = ($newDir, $newEnv)
-	    }  else  {
-		$s =~ s/^/#  /mg;
-	    }
-	    print BUILDFILE "\n# eid=$eid\n$errorMsg$s"
-	}
-    }
+    my %allowedExecTypes = (gcc => 1, 'g++' => 1);
+    WriteAssessCmdsFile($data, $BUILDFILE, $cpptestscanFunc, \@cpptestscanCmd, \%allowedExecTypes);
 
     my @cmd = ($toolPath,
 		'-data', $workspaceDir,
@@ -4028,11 +4043,11 @@ EOF
 	my @jvmOpts = split ' ', $jvmOpts;
 	push @cmd, @jvmOpts;
     }
-    print BUILDFILE "\n\n\n# Assess using C/C++test\n";
-    print BUILDFILE "cd ", BashQuote($resultsDir), "\n\n";
-    print BUILDFILE GetCmdString(\@cmd), "\n";
+    print $BUILDFILE "\n\n\n# Assess using C/C++test\n";
+    print $BUILDFILE "cd ", BashQuote($resultsDir), "\n\n";
+    print $BUILDFILE GetCmdString(\@cmd), "\n";
 
-    close BUILDFILE or die "close $filename: $!";
+    close $BUILDFILE or die "close $filename: $!";
 
     chmod 0755, $filename or die "chmod 0755, $filename";
 
@@ -4125,12 +4140,12 @@ sub DoParasoftCtestAssessment
     my $workspaceName = 'parasoft_workspace';
     $workspaceName = $toolConf->{'tool-ps-ctest-workspace'} if HasValue $toolConf->{'tool-ps-ctest-workspace'};
     my $testConfig = $toolConf->{'tool-ps-ctest-config'};
-    die "tool-ps-ctest-config not defined in $toolConf" unless HasValue $testConfig;
+    die "tool-ps-ctest-config not defined in $toolConfFile" unless HasValue $testConfig;
     my $localsettingsFile = 'ps-ctest.properties';
     $localsettingsFile = $toolConf->{'tool-ps-ctest-localsettings'} if HasValue $toolConf->{'tool-ps-ctest-localsettings'};
     my $localsettingsPath = "$resultsDir/$localsettingsFile";
     my $cpptestscanCmd = $toolConf->{'tool-ps-ctest-cpptestscan'};
-    die "tool-ps-ctest-cpptestscan not defined in $toolConf" unless HasValue $cpptestscanCmd;
+    die "tool-ps-ctest-cpptestscan not defined in $toolConfFile" unless HasValue $cpptestscanCmd;
     my $cpptestscanCmdPath = "$toolDir/$cpptestscanCmd";
     my $bdfFile = "$resultsDir/$projName.bdf";
     my $reportDir = "$resultsDir/report";
@@ -4154,28 +4169,16 @@ sub DoParasoftCtestAssessment
     }
     close TOOLVER or die "close $toolPath --version|: $!";
     chomp $toolVersion;
+    $toolConf->{'#toolVersionText'} = $toolVersion;
 
     my $asFile = "$resultsDir/assessment_summary.xml";
-    open ASFILE, ">", $asFile or die "open $asFile: $!";
+    open my $asFH, ">", $asFile or die "open $asFile: $!";
+
     my $indent = 0;
-    my ($indent1, $indent2);
-    if (defined $indent)  {
-	$indent1 = $indent + 1;
-	$indent2 = $indent1 + 1;
-    }
-    print ASFILE XmlDecl('1.0', 'utf-8', $indent);
-    print ASFILE XmlOpenTag('assessment-summary', $indent);
-    print ASFILE XmlElem('assessment-summary-uuid', $uuid, $indent1);
-    print ASFILE XmlElem('build-summary-uuid', $data->{uuid}, $indent1);
-    print ASFILE XmlElem('build-root-dir', $buildRootDir, $indent1);
-    print ASFILE XmlElem('package-root-dir', $data->{packageRootDir}, $indent1);
-    print ASFILE XmlElem('platform-name', $data->{platName}, $indent1);
-    print ASFILE XmlElem('platform-uuid', $data->{platUuid}, $indent1);
-    print ASFILE XmlElem('package-name', $data->{pkgName}, $indent1);
-    print ASFILE XmlElem('package-version', $data->{pkgVersion}, $indent1);
-    print ASFILE XmlElem('tool-type', $toolType, $indent1);
-    print ASFILE XmlElem('tool-version', $toolVersion, $indent1);
-    print ASFILE XmlOpenTag('assessment-artifacts', $indent1);
+    my $indent2;
+    $indent2 = $indent + 2 if defined $indent;
+
+    PrintAssessmentSummaryHeaderXml($asFH, $indent, $data, $toolConf, $uuid);
 
     chdir $buildRootDir or die "chdir $buildRootDir";
 
@@ -4235,7 +4238,7 @@ EOF
     $resultFileName =~ s/.*\///;
     $resultFileName .= '/report.xml';
 
-    print ASFILE XmlAssessment($cmd[0], \@cmd, \%ENV, $buildRootDir,
+    print $asFH XmlAssessment($cmd[0], \@cmd, \%ENV, $buildRootDir,
 				$resultFileName, $stdoutFileName, $stderrFileName, $id,
 				$exitCode, $exitSignalName, $startTs, $stopTs, $indent2);
 
@@ -4243,11 +4246,10 @@ EOF
 
     chdir $savedCwd;
 
-    print ASFILE XmlCloseTag('assessment-artifacts', $indent1);
-    print ASFILE XmlElem('start-ts', $assessStartTs, $indent1);
-    print ASFILE XmlElem('stop-ts', $assessStopTs, $indent1);
-    print ASFILE XmlCloseTag('assessment-summary', $indent);
-    close ASFILE or die "close $asFile: $!";
+    PrintAssessmentSummaryFooterXml($asFH, $indent, $assessStartTs, $assessStopTs);
+
+    close $asFH or die "close $asFile: $!";
+
     return ($pass, $fail, $skip);
 }
 
@@ -4433,26 +4435,13 @@ sub DoHrlTifAssessment
     my $toolVersion = $toolConf->{'tool-version'};
 
     my $asFile = "$resultsDir/assessment_summary.xml";
-    open ASFILE, ">", $asFile or die "open $asFile: $!";
+    open my $asFH, ">", $asFile or die "open $asFile: $!";
+
     my $indent = 0;
-    my ($indent1, $indent2);
-    if (defined $indent)  {
-	$indent1 = $indent + 1;
-	$indent2 = $indent1 + 1;
-    }
-    print ASFILE XmlDecl('1.0', 'utf-8', $indent);
-    print ASFILE XmlOpenTag('assessment-summary', $indent);
-    print ASFILE XmlElem('assessment-summary-uuid', $uuid, $indent1);
-    print ASFILE XmlElem('build-summary-uuid', $data->{uuid}, $indent1);
-    print ASFILE XmlElem('build-root-dir', $buildRootDir, $indent1);
-    print ASFILE XmlElem('package-root-dir', $data->{packageRootDir}, $indent1);
-    print ASFILE XmlElem('platform-name', $data->{platName}, $indent1);
-    print ASFILE XmlElem('platform-uuid', $data->{platUuid}, $indent1);
-    print ASFILE XmlElem('package-name', $data->{pkgName}, $indent1);
-    print ASFILE XmlElem('package-version', $data->{pkgVersion}, $indent1);
-    print ASFILE XmlElem('tool-type', $toolType, $indent1);
-    print ASFILE XmlElem('tool-version', $toolVersion, $indent1);
-    print ASFILE XmlOpenTag('assessment-artifacts', $indent1);
+    my $indent2;
+    $indent2 = $indent + 2 if defined $indent;
+
+    PrintAssessmentSummaryHeaderXml($asFH, $indent, $data, $toolConf, $uuid);
 
     chdir $buildRootDir or die "chdir $buildRootDir";
 
@@ -4483,7 +4472,7 @@ sub DoHrlTifAssessment
 	print STDERR "# Error: ", GetExecErrorMsg(\@cmd, $exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus), "\n";
     }
 
-    print ASFILE XmlAssessment($cmd[0], \@cmd, \%ENV, $buildRootDir,
+    print $asFH XmlAssessment($cmd[0], \@cmd, \%ENV, $buildRootDir,
 				$resultsFileName, $stdoutFileName, $stderrFileName, $id,
 				$exitCode, $exitSignalName, $startTs, $stopTs, $indent2);
 
@@ -4491,11 +4480,10 @@ sub DoHrlTifAssessment
 
     chdir $savedCwd;
 
-    print ASFILE XmlCloseTag('assessment-artifacts', $indent1);
-    print ASFILE XmlElem('start-ts', $assessStartTs, $indent1);
-    print ASFILE XmlElem('stop-ts', $assessStopTs, $indent1);
-    print ASFILE XmlCloseTag('assessment-summary', $indent);
-    close ASFILE or die "close $asFile: $!";
+    PrintAssessmentSummaryFooterXml($asFH, $indent, $assessStartTs, $assessStopTs);
+
+    close $asFH or die "close $asFile: $!";
+
     return ($pass, $fail, $skip);
 }
 
@@ -5007,30 +4995,18 @@ EOF
 	die $@;
     }
     $toolVersion = $hubInfo->{Process}{Version} if defined $hubInfo->{Process}{Version};
+    $toolConf->{'#toolVersionText'} = $toolVersion;
     
 
     # run assessment
     my $asFile = "$resultsDir/assessment_summary.xml";
-    open ASFILE, ">", $asFile or die "open $asFile: $!";
+    open my $asFH, ">", $asFile or die "open $asFile: $!";
+
     my $indent = 0;
-    my ($indent1, $indent2);
-    if (defined $indent)  {
-	$indent1 = $indent + 1;
-	$indent2 = $indent1 + 1;
-    }
-    print ASFILE XmlDecl('1.0', 'utf-8', $indent);
-    print ASFILE XmlOpenTag('assessment-summary', $indent);
-    print ASFILE XmlElem('assessment-summary-uuid', $uuid, $indent1);
-    print ASFILE XmlElem('build-summary-uuid', $data->{uuid}, $indent1);
-    print ASFILE XmlElem('build-root-dir', $buildRootDir, $indent1);
-    print ASFILE XmlElem('package-root-dir', $data->{packageRootDir}, $indent1);
-    print ASFILE XmlElem('platform-name', $data->{platName}, $indent1);
-    print ASFILE XmlElem('platform-uuid', $data->{platUuid}, $indent1);
-    print ASFILE XmlElem('package-name', $data->{pkgName}, $indent1);
-    print ASFILE XmlElem('package-version', $data->{pkgVersion}, $indent1);
-    print ASFILE XmlElem('tool-type', $toolType, $indent1);
-    print ASFILE XmlElem('tool-version', $toolVersion, $indent1);
-    print ASFILE XmlOpenTag('assessment-artifacts', $indent1);
+    my $indent2;
+    $indent2 = $indent + 2 if defined $indent;
+
+    PrintAssessmentSummaryHeaderXml($asFH, $indent, $data, $toolConf, $uuid);
 
     chdir $buildRootDir or die "chdir $buildRootDir";
 
@@ -5100,7 +5076,7 @@ EOF
     my $analysisFile = GetCodeSonarWarnings "http://$csonarHubHostPort", $resultsDirPath;
     my $analysisFilePath = "$resultsDirName/$analysisFile";
 
-    print ASFILE XmlAssessment($cmd[0], \@cmd, \%ENV, $buildRootDir,
+    print $asFH XmlAssessment($cmd[0], \@cmd, \%ENV, $buildRootDir,
 				$analysisFilePath, $stdoutFileName, $stderrFileName, $id,
 				$exitCode, $exitSignalName, $startTs, $stopTs, $indent2);
 
@@ -5116,11 +5092,254 @@ EOF
 
     chdir $savedCwd;
 
-    print ASFILE XmlCloseTag('assessment-artifacts', $indent1);
-    print ASFILE XmlElem('start-ts', $assessStartTs, $indent1);
-    print ASFILE XmlElem('stop-ts', $assessStopTs, $indent1);
-    print ASFILE XmlCloseTag('assessment-summary', $indent);
-    close ASFILE or die "close $asFile: $!";
+    PrintAssessmentSummaryFooterXml($asFH, $indent, $assessStartTs, $assessStopTs);
+
+    close $asFH or die "close $asFile: $!";
+
+    return ($pass, $fail, $skip);
+}
+
+
+
+########################## Synopsys Coverity ###########################
+
+
+sub WriteSynopsysCoverityAssessCmdsFile
+{
+    my ($data, $filename,
+		$covConfig, $covDataDir,
+		$covConfigure, $covTranslate, $covAnalyze, $covFormatErrors,
+		$jsonOutput, $htmlOutput, $emacsOutput) = @_;
+
+    my %buildCommands;
+    my $eids = $data->{eids};
+    foreach my $eid (@{$data->{buildEids}})  {
+	my $e = $eids->{$eid};
+	my $buildExecType = $e->{buildInfo}{buildExecType};
+	my $path = $e->{cmdPath};
+	$buildCommands{$buildExecType}{$path} = 1;
+    }
+
+    my @covConfigOpts	= ('--config',	$covConfig);
+    my @covDirOpts	= ('--dir', 	$covDataDir);
+    my @covConfigureCmd = ($covConfigure, @covConfigOpts);
+    my @covTranslateCmd = ($covTranslate, @covConfigOpts, @covDirOpts);
+    my @covAnalyzeCmd	= ($covAnalyze, @covConfigOpts, @covDirOpts);
+    my @covFormatErrorsCmd = ($covFormatErrors, @covDirOpts);
+
+    open my $BUILDFILE, ">$filename" or die "open $filename: $!";
+
+    my $configCmds = <<EOF;
+# Create directory for Coverity Data
+
+mkdir $covDataDir
+
+
+# Configure compilers
+
+EOF
+    foreach my $type (keys %buildCommands)  {
+	next unless $type =~ /^g(cc|\+\+)$/;
+	my $paths = $buildCommands{$type};
+	my %compilers;
+	foreach my $path (keys %$paths)  {
+	    my $compiler = $path;
+	    $compiler =~ s/^.*\///;
+	    next if $compilers{$compiler};
+
+	    my @cmd = @covConfigureCmd;
+	    if ($compiler =~ /^g(cc|\+\+)$/)  {
+		$compilers{gcc} = 1;
+		$compilers{'g++'} = 1;
+		push @cmd, '--gcc';
+	    }  else  {
+		$compilers{$compiler} = 1;
+		push @cmd, '--comptype', 'gcc', '--compiler', $compiler, '--template';
+	    }
+
+	    my $cmd = GetCmdString(\@cmd);
+	    $configCmds .= "\n$cmd\n";
+	}
+    }
+
+    my $covTranslateFunc = "CovTranslate";
+
+    WriteAssessCmdsFile($data, $BUILDFILE, $covTranslateFunc, \@covTranslateCmd,
+			undef, $configCmds);
+
+    print $BUILDFILE "\n\n\n# Assess using Coverity\n";
+    print $BUILDFILE GetCmdString(\@covAnalyzeCmd), "\n";
+    print $BUILDFILE "\n\n\n# Produce output\n";
+    my @cmd = (@covFormatErrorsCmd, '--json-output-v2', $jsonOutput);
+    print $BUILDFILE GetCmdString(\@cmd), "\n";
+    @cmd = (@covFormatErrorsCmd, '-x', '--html-output', $htmlOutput);
+    print $BUILDFILE GetCmdString(\@cmd), "\n";
+    @cmd = (@covFormatErrorsCmd, '--emacs-style');
+    print $BUILDFILE GetCmdString(\@cmd), " > $emacsOutput\n";
+
+    close $BUILDFILE or die "close $filename: $!";
+
+    chmod 0755, $filename or die "chmod 0755, $filename";
+
+    return \%buildCommands;
+}
+
+
+sub HostnameToIpAddr
+{
+    my ($hostname) = @_;
+
+    use Socket;
+    my $packed_ip = gethostbyname($hostname);
+    if (defined $packed_ip) {
+	my $ip_address = inet_ntoa($packed_ip);
+	return $ip_address;
+    }
+    return;
+}
+
+
+sub CheckCoverityLicenseFailure
+{
+    my ($exitCode, $stderrPath) = @_;
+
+    return 0 if $exitCode == 0;
+
+    my $lineNum = 0;
+    my $errLineNum;
+    my $msg;
+    my $done;
+    open ERRFILE, "<", $stderrPath or die "open $stderrPath: $!";
+    while (<ERRFILE>)  {
+	++$lineNum;
+	if (defined $msg)  {
+	    $msg .= $_;
+	    if (/^For more information about FLEXnet/)  {
+		$done = 1;
+		last;
+	    }
+	}  elsif (!$done && /^FLEXnet license.*error/)  {
+	    $errLineNum = $lineNum;
+	    $msg = $_;
+	}
+    }
+    close ERRFILE or die "close $stderrPath: $!";
+
+    if (defined $msg)  {
+	print STDERR "Coverity license acquire failed at $stderrPath line $errLineNum:\n$msg";
+	$@ = LogStatus('assess-acquire-license', '', 1, undef, "Coverity license failure at $stderrPath:$errLineNum:\n$msg");
+    }
+
+    return (defined $msg);
+}
+
+
+sub DoSynopsysCoverityAssessment
+{
+    my ($data, $toolType, $resultsDir, $toolPath, $toolOpt, $toolConfFile, $toolDir, $servicesConfFile) = @_;
+    my ($pass, $fail, $skip) = (0, 0);
+    my $uuid = GetUuid();
+    my $assessStartTs = GetCurTs();
+    my $savedCwd = getcwd();
+    my $buildRootDir = $data->{buildRootDir};
+    my $id = 0;
+
+    my $toolConf = ReadConfFile($toolConfFile);
+
+    if (defined $toolConf->{'tool-license-file'} && -f $toolConf->{'tool-license-file'})  {
+	use File::Copy;
+	my $license = "/mnt/in/" . $toolConf->{'tool-license-file'};
+	my $to = "$toolDir/" . $toolConf->{'tool-license-dat-file'};
+	copy $license, $to or die "cp $license, $to: $!";
+    }  else  {
+	die "--servicesconf file required, but option missing" unless defined $servicesConfFile;
+	my $servicesConf = ReadConfFile($servicesConfFile) if defined $servicesConfFile;
+	my $licenseHost = $servicesConf->{'tool-sy-coverity-license-host'};
+	my $licensePort = $servicesConf->{'tool-sy-coverity-license-port'};
+	my $licenseConfigFile = $toolConf->{'tool-license-config-file'};
+	$licenseConfigFile = "$toolDir/$licenseConfigFile" unless $licenseConfigFile =~ /^\//;
+	die "tool-coverity-license-host not defined in $servicesConfFile" unless HasValue $licenseHost;
+	die "tool-coverity-license-port not defined in $servicesConfFile" unless HasValue $licensePort;
+	#WriteFile($licenseConfigFile, "#FLEXnet\nlicense-server $licensePort\@$licenseHost\n");
+
+	# Coverity does not use DNS on some platforms, so convert to IP Address.
+	my $host = HostnameToIpAddr($licenseHost);
+	if (!defined $host)  {
+	    my $reason = "Failed to convert Coverity license server host '$licenseHost' to IP Address\n";
+	    print STDERR $reason;
+	    $@ = LogStatus('assess-acquire-license', '', 1, undef, $reason);
+	    ++$fail;
+	    return ($pass, $fail, $skip);
+	}
+	WriteFile($licenseConfigFile, "#FLEXnet\nlicense-server $licensePort\@$host\n");
+    }
+
+    my $toolVersion = $toolConf->{'tool-version'};
+
+    my $covConfig = "$resultsDir/" . $toolConf->{'tool-coverity-config-file'};
+    my $covDataDir = "$resultsDir/" . $toolConf->{'tool-coverity-data'};
+    my $covConfigure = "$toolDir/" . $toolConf->{'tool-coverity-configure'};
+    my $covTranslate = "$toolDir/" . $toolConf->{'tool-coverity-translate'};
+    my $covAnalyze = "$toolDir/" . $toolConf->{'tool-coverity-analyze'};
+    my $covFormatErrors = "$toolDir/" . $toolConf->{'tool-coverity-format-errors'};
+
+    my $asFile = "$resultsDir/assessment_summary.xml";
+    open my $asFH, ">", $asFile or die "open $asFile: $!";
+
+    my $indent = 0;
+    my $indent2;
+    $indent2 = $indent + 2 if defined $indent;
+
+    PrintAssessmentSummaryHeaderXml($asFH, $indent, $data, $toolConf, $uuid);
+
+    chdir $buildRootDir or die "chdir $buildRootDir";
+
+    ++$id;
+    my $stdoutFileName = "stdout$id.out";
+    my $stderrFileName = "stderr$id.out";
+    my $stdoutPath = "$resultsDir/$stdoutFileName";
+    my $stderrPath = "$resultsDir/$stderrFileName";
+    my $assessCmdsFile = "$resultsDir/assessCmds$id.sh";
+
+    my $jsonOutput = "$resultsDir/results$id.json";
+    my $htmlOutput = "$resultsDir/results${id}_html";
+    my $emacsOutput = "$resultsDir/results$id.emacs";
+
+    WriteSynopsysCoverityAssessCmdsFile($data, $assessCmdsFile,
+				    $covConfig, $covDataDir,
+				    $covConfigure, $covTranslate, $covAnalyze, $covFormatErrors,
+				    $jsonOutput, $htmlOutput, $emacsOutput);
+
+    my @cmd = ($assessCmdsFile);
+
+    print STDERR GetCmdString(\@cmd), "\n";
+
+    my $startTs = GetCurTs();
+    my ($exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus)
+	    = ExecCmd(\@cmd, undef, undef, $stdoutPath, $stderrPath);
+    my $stopTs = GetCurTs();
+    if ($exitStatus == 0)  {
+	++$pass;
+    }  else  {
+	++$fail;
+	print STDERR "# Error: ", GetExecErrorMsg(\@cmd, $exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus), "\n";
+	CheckCoverityLicenseFailure($exitCode, $stderrPath);
+    }
+
+    my $resultFileName = $jsonOutput;
+    $resultFileName =~ s/.*\///;
+
+    print $asFH XmlAssessment($cmd[0], \@cmd, \%ENV, $buildRootDir,
+				$resultFileName, $stdoutFileName, $stderrFileName, $id,
+				$exitCode, $exitSignalName, $startTs, $stopTs, $indent2);
+
+    my $assessStopTs = GetCurTs();
+
+    chdir $savedCwd;
+
+    PrintAssessmentSummaryFooterXml($asFH, $indent, $assessStartTs, $assessStopTs);
+
+    close $asFH or die "close $asFile: $!";
 
     return ($pass, $fail, $skip);
 }
@@ -5261,26 +5480,13 @@ sub DoGoannaAssessment
 
     # run assessment
     my $asFile = "$resultsDir/assessment_summary.xml";
-    open ASFILE, ">", $asFile or die "open $asFile: $!";
+    open my $asFH, ">", $asFile or die "open $asFile: $!";
+
     my $indent = 0;
-    my ($indent1, $indent2);
-    if (defined $indent)  {
-	$indent1 = $indent + 1;
-	$indent2 = $indent1 + 1;
-    }
-    print ASFILE XmlDecl('1.0', 'utf-8', $indent);
-    print ASFILE XmlOpenTag('assessment-summary', $indent);
-    print ASFILE XmlElem('assessment-summary-uuid', $uuid, $indent1);
-    print ASFILE XmlElem('build-summary-uuid', $data->{uuid}, $indent1);
-    print ASFILE XmlElem('build-root-dir', $buildRootDir, $indent1);
-    print ASFILE XmlElem('package-root-dir', $data->{packageRootDir}, $indent1);
-    print ASFILE XmlElem('platform-name', $data->{platName}, $indent1);
-    print ASFILE XmlElem('platform-uuid', $data->{platUuid}, $indent1);
-    print ASFILE XmlElem('package-name', $data->{pkgName}, $indent1);
-    print ASFILE XmlElem('package-version', $data->{pkgVersion}, $indent1);
-    print ASFILE XmlElem('tool-type', $toolType, $indent1);
-    print ASFILE XmlElem('tool-version', $toolVersion, $indent1);
-    print ASFILE XmlOpenTag('assessment-artifacts', $indent1);
+    my $indent2;
+    $indent2 = $indent + 2 if defined $indent;
+
+    PrintAssessmentSummaryHeaderXml($asFH, $indent, $data, $toolConf, $uuid);
 
     ++$id;
     my $stdoutFileName = "goanna_trace_stdout$id.out";
@@ -5329,7 +5535,7 @@ sub DoGoannaAssessment
 	print STDERR "# Error: ", GetExecErrorMsg(\@cmd, $exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus), "\n";
     }
 
-    print ASFILE XmlAssessment($cmd[0], \@cmd, \%ENV, $buildRootDir,
+    print $asFH XmlAssessment($cmd[0], \@cmd, \%ENV, $buildRootDir,
 				$goannaOutputFile, $stdoutFileName, $stderrFileName, $id,
 				$exitCode, $exitSignalName, $startTs, $stopTs, $indent2);
 
@@ -5347,11 +5553,9 @@ sub DoGoannaAssessment
     chdir $savedCwd or die "chdir $savedCwd: $!";
     print STDERR "cd ", BashQuote($savedCwd), "\n";
 
-    print ASFILE XmlCloseTag('assessment-artifacts', $indent1);
-    print ASFILE XmlElem('start-ts', $assessStartTs, $indent1);
-    print ASFILE XmlElem('stop-ts', $assessStopTs, $indent1);
-    print ASFILE XmlCloseTag('assessment-summary', $indent);
-    close ASFILE or die "close $asFile: $!";
+    PrintAssessmentSummaryFooterXml($asFH, $indent, $assessStartTs, $assessStopTs);
+
+    close $asFH or die "close $asFile: $!";
 
     return ($pass, $fail, $skip);
 }
@@ -5366,6 +5570,9 @@ sub DoAssessment
     my ($data, $toolType, $resultsDir, $toolPath, $toolOpt, $toolConfFile, $toolDir,
 		$servicesConfFile, $toolsBaseDir) = @_;
     my ($pass, $fail, $skip);
+
+    $data->{assessFw} = $data->{fw};
+    $data->{assessFwVersion} = $data->{fwVersion};
 
     die "DoAssessment resultDir ($resultsDir) does not exist" unless -d $resultsDir;
     
@@ -5385,6 +5592,8 @@ sub DoAssessment
 	($pass, $fail, $skip) = DoCodeSonarAssessment(@_);
     }  elsif ($toolType eq 'rl-goanna')  {
 	($pass, $fail, $skip) = DoGoannaAssessment(@_);
+    }  elsif ($toolType eq 'coverity')  {
+	($pass, $fail, $skip) = DoSynopsysCoverityAssessment(@_);
     }  else  {
 	die "DoAssessment unknown tooltype ($toolType)";
     }
@@ -5397,6 +5606,9 @@ sub DoBuildAndProcess
 {
     my $data = shift;
     my ($startTs, $stopTs, $dur);
+
+    $data->{buildFw} = $data->{fw};
+    $data->{buildFwVersion} = $data->{fwVersion};
 
     if (!$options{nobuild})  {
 	print STDERR scalar(localtime), "    Begin build\n";
@@ -5415,6 +5627,7 @@ sub DoBuildAndProcess
     $options{packagerootdir} = $initialCwd unless defined $options{packagerootdir};
     $options{buildrootdir} = $initialCwd unless defined $options{buildrootdir};
     %$data = (
+		%$data,
 		initialCwd	=> $initialCwd,
 		packageRootDir	=> $options{packagerootdir},
 		buildRootDir	=> $options{buildrootdir},
@@ -5453,9 +5666,9 @@ sub DoBuildAndProcess
 
     eval {
 	if ($options{buildsummary})  {
-	    open my $outFH, ">$options{buildsummary}" or die "open >$options{buildsummary}: $!";
+	    open my $outFH, ">", $options{buildsummary} or die "open $options{buildsummary}: $!";
 	    PrintBuildXml($outFH, $data, 0);
-	    close $outFH  or die "close <$options{buildsummary}: $!";
+	    close $outFH  or die "close $options{buildsummary}: $!";
 	}
 
 	my $debugInfo = $options{debuginfo};
@@ -5473,7 +5686,11 @@ sub DoBuildAndProcess
 
 print STDERR scalar(localtime), "-------------------\n";
 
-my %data;
+my %data = (
+	fw		=> $fwName,
+	fwVersion	=> $fwVersion
+);
+
 eval {
     ProcessOptions();
     my $startTs = GetCurTs();

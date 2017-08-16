@@ -1,4 +1,13 @@
 -------------------------------------
+C-assess  version 1.1.8 (Aug 04, 2017)
+-------------------------------------
+- support for coverity
+- tool-install-cmd and tool-install-opt now eval %var
+- add framework type and version for build and assess to xml files
+- remove --log-file and --output-dir options from resultparser
+- do not set PERL5LIB for resultparser
+
+-------------------------------------
 C-assess  version 1.1.7 (Apr 10, 2017)
 -------------------------------------
 - put platform name and uuid, and package name and version in xml files

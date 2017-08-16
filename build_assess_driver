@@ -26,7 +26,7 @@ use Getopt::Long;
 use Time::HiRes qw( gettimeofday );
 
 
-my $buildAssessDriverVersion = '1.1.7 (Apr 10, 2017)';
+my $buildAssessDriverVersion = '1.1.8 (Aug 04, 2017)';
 my %options;
 my $statusFile;
 
@@ -634,6 +634,7 @@ sub EvalHashValue
     return $k if $k eq '%';
     $l = 0 unless defined $l;
     $k =~ s/^{(.*)}$/$1/;
+    return if $l == 0 && !exists $h->{$k};
     die "EvalError: too much recursion" if ++$l > 50;
     die "EvalError: key '$k' not found" unless exists $h->{$k};
     die "EvalError: value of key '$k' not defined" unless defined $h->{$k};
@@ -1396,14 +1397,15 @@ sub DoPreAssess
     my $toolConfFile = InFile('tool.conf');
     my $servicesConfFile = InFile('services.conf');
     my $toolData = ReadConfFile($toolConfFile);
+    $toolData->{'mnt-in'} = InFile('.');
 
     my $toolArchive = $toolData->{'tool-archive'};
     my $toolDir = $toolData->{'tool-dir'};
     my $toolCmd = $toolData->{'tool-cmd'};
     my $toolType = $toolData->{'tool-type'};
     my $toolOpt = $toolData->{'tool-opt'};
-    my $toolInstallCmd = $toolData->{'tool-install-cmd'};
-    my $toolInstallOpt = $toolData->{'tool-install-opt'};
+    my $toolInstallCmd = EvalHashValue 'tool-install-cmd', $toolData;
+    my $toolInstallOpt = EvalHashValue 'tool-install-opt', $toolData;
     my $toolBaseDir = ConcatPaths($toolsBaseDir, $toolDir);
     my $toolPath;
     if (HasValue $toolCmd)  {
@@ -1606,21 +1608,18 @@ sub DoParseResults
 
     DoChdir($resultsDir);
 
-    my %cmdEnv = %ENV;
-    $cmdEnv{PERL5LIB} = $resultParserDir;
+    my $outputFile = ConcatPaths($parsedResultsBaseDir, 'parsed_results.xml');
+    my $weaknessCountFile = ConcatPaths($parsedResultsBaseDir, 'weaknesses.txt');
 
-    my $weaknessCountFile = 'weaknesses.txt';
     my @cmd = ($resultParserCmd,
 		    '--summary_file', $assessmentSummaryFile,
-		    '--output_dir', $parsedResultsBaseDir,
-		    '--output_file', 'parsed_results.xml',
-		    '--log_file', 'resultparser.log',
+		    '--output_file', $outputFile,
 		    '--weakness_count_file', $weaknessCountFile
 		    );
 
     my ($startTs, $stopTs, $dur);
     $startTs = GetCurTs();
-    eval {PrintAndExecCmdAndFail(\@cmd, \%cmdEnv)};
+    eval {PrintAndExecCmdAndFail(\@cmd)};
     $stopTs = GetCurTs();
     $dur = DiffTs($startTs, $stopTs);
 
