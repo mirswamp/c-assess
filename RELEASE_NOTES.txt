@@ -1,4 +1,9 @@
 -------------------------------------
+C-assess  version 1.1.9 (Sep 14, 2017)
+-------------------------------------
+- update strace package to support centos and scientific linux 6.9
+
+-------------------------------------
 C-assess  version 1.1.8 (Aug 04, 2017)
 -------------------------------------
 - support for coverity

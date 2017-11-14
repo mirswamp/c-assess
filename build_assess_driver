@@ -26,7 +26,7 @@ use Getopt::Long;
 use Time::HiRes qw( gettimeofday );
 
 
-my $buildAssessDriverVersion = '1.1.8 (Aug 04, 2017)';
+my $buildAssessDriverVersion = '1.1.10 (Nov 1, 2017)';
 my %options;
 my $statusFile;
 
@@ -1294,15 +1294,16 @@ sub MakeConfigureCmd
 
     if (!defined $configCmd || $configCmd eq '')  {
 	my %buildSysToConfigCmd = (
-	    'ant'		=> undef,
-	    'ant+ivy'		=> undef,
-	    'maven'		=> undef,
-	    'make'		=> undef,
-	    'configure+make'	=> './configure',
-	    'cmake+make'	=> 'cmake .',
-	    'no-build'		=> undef,
-	    'other'		=> undef,
-	    'none'		=> undef
+	    'ant'			=> undef,
+	    'ant+ivy'			=> undef,
+	    'maven'			=> undef,
+	    'make'			=> undef,
+	    'configure+make'		=> './configure',
+	    'autotools+configure+make'	=> 'mkdir -p m4 && autoreconf --install --force || ./autogen.sh && ./configure',
+	    'cmake+make'		=> 'cmake .',
+	    'no-build'			=> undef,
+	    'other'			=> undef,
+	    'none'			=> undef
 	    );
 	    # gradle java-bytecode python-distutils
 	    # android+ant android+ant+ivy android+maven android+gradle
@@ -1337,15 +1338,16 @@ sub MakeBuildCmd
 
     if (!defined $buildCmd || $buildCmd eq '')  {
 	my %buildSysToBuildCmd = (
-	    'ant'		=> 'ant',
-	    'ant+ivy'		=> 'ant',
-	    'maven'		=> 'mvn',
-	    'make'		=> 'make',
-	    'configure+make'	=> 'make',
-	    'cmake+make'	=> 'make',
-	    'no-build'		=> 'make',
-	    'other'		=> undef,
-	    'none'		=> undef
+	    'ant'			=> 'ant',
+	    'ant+ivy'			=> 'ant',
+	    'maven'			=> 'mvn',
+	    'make'			=> 'make',
+	    'configure+make'		=> 'make',
+	    'autotools+configure+make'	=> 'make',
+	    'cmake+make'		=> 'make',
+	    'no-build'			=> 'make',
+	    'other'			=> undef,
+	    'none'			=> undef
 	    );
 	    # gradle java-bytecode python-distutils
 	    # android+ant android+ant+ivy android+maven android+gradle

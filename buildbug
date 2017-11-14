@@ -26,7 +26,7 @@ use Cwd;
 use Time::HiRes qw( gettimeofday );
 use Data::Dumper;
 
-my $buildBugVersion = '1.1.8 (Aug 04, 2017)';
+my $buildBugVersion = '1.1.10 (Nov 06, 2017)';
 my $fwName = 'c-assess';
 my $fwVersion = $buildBugVersion;
 $fwVersion =~ s/ .*$//;
@@ -3989,8 +3989,9 @@ EOF
 
 sub WriteCpptestAssessCmdsFile
 {
-    my ($data, $filename, $cpptestscanCmdPath, $toolPath, $localsettingsFile, $bdfFile,
-		$projName, $testConfig, $jvmOpts, $workspaceDir, $reportDir, $resultsDir) = @_;
+    my ($data, $filename, $cpptestscanCmdPath, $toolPath, $toolMajorVersion, $localsettingsFile,
+		$bdfFile, $projName, $testConfig, $jvmOpts, $workspaceDir, $reportDir,
+		$resultsDir) = @_;
 
     my ($ccCmd, $cxxCmd);
     my $eids = $data->{eids};
@@ -4023,21 +4024,28 @@ sub WriteCpptestAssessCmdsFile
     my @cpptestscanCmd = (
 			    $cpptestscanCmdPath,
 			    "--cpptestscanOutputFile=$bdfFile",
-			    "--cpptestscanProjectName=$projName",
-			    "--cpptestscanRunOrigCmd=no"
+			    "--cpptestscanRunOrigCmd=no",
 			);
+    push @cpptestscanCmd, "--cpptestscanProjectName=$projName" if $toolMajorVersion <= 9;
 
     my %allowedExecTypes = (gcc => 1, 'g++' => 1);
     WriteAssessCmdsFile($data, $BUILDFILE, $cpptestscanFunc, \@cpptestscanCmd, \%allowedExecTypes);
 
+    my ($workspaceOpt, $inputOpt);
+    if ($toolMajorVersion <= 9)  {
+	($workspaceOpt, $inputOpt) = qw/ -data	-bdf /;
+    }  else  {
+	# version >= 10
+	($workspaceOpt, $inputOpt) = qw/ -workspace	-input /;
+    }
     my @cmd = ($toolPath,
-		'-data', $workspaceDir,
-		'-resource', $projName,
+		$workspaceOpt, $workspaceDir,
 		'-localsettings', $localsettingsFile,
 		'-config', $testConfig,
-		'-bdf', $bdfFile,
+		$inputOpt, $bdfFile,
 		'-report', $reportDir,
 		'-showdetails');
+    push @cmd, '-resource', $projName if HasValue $projName;
 
     if (HasValue $jvmOpts)  {
 	my @jvmOpts = split ' ', $jvmOpts;
@@ -4123,6 +4131,19 @@ sub CheckParasoftCompatibility
 }
 
 
+sub CheckOptionsExist
+{
+    my ($required, $options, $files) = @_;
+    my @missing;
+
+    foreach my $opt (@$required)  {
+	push @missing, $opt unless HasValue $options->{$opt};
+    }
+
+    die "options '@missing' are required to be defined in $files" if @missing;
+}
+
+
 sub DoParasoftCtestAssessment
 {
     my ($data, $toolType, $resultsDir, $toolPath, $toolOpt, $toolConfFile, $toolDir, $servicesConfFile) = @_;
@@ -4131,45 +4152,91 @@ sub DoParasoftCtestAssessment
     my $assessStartTs = GetCurTs();
     my $savedCwd = getcwd();
     my $buildRootDir = $data->{buildRootDir};
-    my $toolVersion = '';
+    my $toolVersionText = '';
     my $id = 0;
 
     my $toolConf = ReadConfFile($toolConfFile);
-    my $projName = 'proj';
-    $projName = $toolConf->{'tool-ps-ctest-proj'} if HasValue $toolConf->{'tool-ps-ctest-proj'};
-    my $workspaceName = 'parasoft_workspace';
-    $workspaceName = $toolConf->{'tool-ps-ctest-workspace'} if HasValue $toolConf->{'tool-ps-ctest-workspace'};
-    my $testConfig = $toolConf->{'tool-ps-ctest-config'};
-    die "tool-ps-ctest-config not defined in $toolConfFile" unless HasValue $testConfig;
-    my $localsettingsFile = 'ps-ctest.properties';
-    $localsettingsFile = $toolConf->{'tool-ps-ctest-localsettings'} if HasValue $toolConf->{'tool-ps-ctest-localsettings'};
-    my $localsettingsPath = "$resultsDir/$localsettingsFile";
-    my $cpptestscanCmd = $toolConf->{'tool-ps-ctest-cpptestscan'};
-    die "tool-ps-ctest-cpptestscan not defined in $toolConfFile" unless HasValue $cpptestscanCmd;
-    my $cpptestscanCmdPath = "$toolDir/$cpptestscanCmd";
-    my $bdfFile = "$resultsDir/$projName.bdf";
-    my $reportDir = "$resultsDir/report";
-    my $projDir = "$resultsDir/$projName";
-    my $workspaceDir = "$resultsDir/$workspaceName";
-    my $jvmOpts = $toolConf->{'tool-ps-ctest-jvm-opts'};
-
     die "--servicesconf file required, but option missing" unless defined $servicesConfFile;
     my $servicesConf = ReadConfFile($servicesConfFile) if defined $servicesConfFile;
-    my $ctestLicenseHost = $servicesConf->{'tool-ps-ctest-license-host'};
-    my $ctestLicensePort = $servicesConf->{'tool-ps-ctest-license-port'};
-    die "tool-ps-ctest-license-host not defined in $servicesConfFile" unless HasValue $ctestLicenseHost;
-    die "tool-ps-ctest-license-port not defined in $servicesConfFile" unless HasValue $ctestLicensePort;
 
+    my $toolVersion = $toolConf->{'tool-version'};
+    my $toolMajorVersion = $toolVersion;
+    $toolMajorVersion =~ s/\..*$//;
+
+    my %toolDefaults = qw/
+	    tool-ps-ctest-workspace			parasoft_workspace
+	    tool-ps-ctest-localsettings			ps-test.properties
+	    tool-ps-ctest-license-use-network		true
+	    tool-ps-ctest-license-network-type		ls
+	    tool-ps-ctest-license-network-edition	server_edition
+	    tool-ps-ctest-bdf-file			proj.bdf
+	    tool-ps-ctest-report-dirname		report
+	    tool-ps-ctest-license-port			2002
+	    tool-ps-ctest-dtp-port			8443
+	/;
+    $toolDefaults{'tool-ps-ctest-report-format'} = "cvs,html,pdf,xml";
+    $toolDefaults{'tool-ps-ctest-proj'} = 'proj' if $toolMajorVersion <= 9;
+
+    # No defaults for these:
+    #   tool-ps-ctest-cpptestscan			
+    #   tool-ps-ctest-config
+    #   tool-ps-ctest-jvm-opts
+    #   tool-ps-ctest-license-host
+    #   tool-ps-ctest-dtp-server
+    #   tool-ps-ctest-dtp-user
+    #   tool-ps-ctest-dtp-password
+
+    my %toolOptions = (%toolDefaults, %$toolConf, %$servicesConf);
+
+    my @requiredOptions = qw/
+	    tool-ps-ctest-workspace
+	    tool-ps-ctest-localsettings
+	    tool-ps-ctest-license-use-network
+	    tool-ps-ctest-license-network-type
+	    tool-ps-ctest-license-network-edition
+	    tool-ps-ctest-bdf-file
+	    tool-ps-ctest-report-dirname
+	    tool-ps-ctest-cpptestscan
+	    tool-ps-ctest-config
+	    /;
+    if ($toolMajorVersion <= 9)  {
+	push @requiredOptions, qw/tool-ps-ctest-proj tool-ps-ctest-license-port tool-ps-ctest-license-host/;
+    }  else  {
+	push @requiredOptions, qw/tool-ps-ctest-report-format tool-ps-ctest-dtp-port tool-ps-ctest-dtp-server
+				tool-ps-ctest-dtp-user tool-ps-ctest-dtp-password/;
+    }
+
+    CheckOptionsExist(\@requiredOptions, \%toolOptions, "$servicesConfFile or $toolConfFile");
+
+    my $projName		= $toolOptions{'tool-ps-ctest-proj'};
+    my $workspaceName		= $toolOptions{'tool-ps-ctest-workspace'};
+    my $testConfig		= $toolOptions{'tool-ps-ctest-config'};
+    my $localsettingsFile	= $toolOptions{'tool-ps-ctest-localsettings'};
+    my $localsettingsPath	= "$resultsDir/$localsettingsFile";
+    my $cpptestscanCmd		= $toolOptions{'tool-ps-ctest-cpptestscan'};
+    my $cpptestscanCmdPath	= "$toolDir/$cpptestscanCmd";
+    my $bdfFile			= "$resultsDir/" . $toolOptions{'tool-ps-ctest-bdf-file'};
+    my $reportDir		= "$resultsDir/" . $toolOptions{'tool-ps-ctest-report-dirname'};
+    my $projDir;
+    my $workspaceDir		= "$resultsDir/$workspaceName";
+    my $licenseUseNetwork	= $toolOptions{'tool-ps-ctest-license-use-network'};
+    my $licenseNetworkType	= $toolOptions{'tool-ps-ctest-license-network-type'};
+    my $licenseNetworkEdition	= $toolOptions{'tool-ps-ctest-license-network-edition'};
+    my $jvmOpts			= $toolOptions{'tool-ps-ctest-jvm-opts'};
+
+    if (HasValue $projName)  {
+	$projDir = "$resultsDir/$projName" if HasValue $projName;
+	mkdir $projDir or die "mkdir $projDir: $!";
+    }
     mkdir $reportDir or die "mkdir $reportDir: $!";
-    mkdir $projDir or die "mkdir $projDir: $!";
 
     open TOOLVER, "$toolPath -version 2>&1 |" or die "open $toolPath -version |: $!";
     while (<TOOLVER>)  {
-	$toolVersion .= $_;
+	$toolVersionText .= $_;
     }
     close TOOLVER or die "close $toolPath --version|: $!";
-    chomp $toolVersion;
-    $toolConf->{'#toolVersionText'} = $toolVersion;
+    chomp $toolVersionText;
+    $toolConf->{'#toolVersionText'} = $toolVersionText;
 
     my $asFile = "$resultsDir/assessment_summary.xml";
     open my $asFH, ">", $asFile or die "open $asFile: $!";
@@ -4190,8 +4257,8 @@ sub DoParasoftCtestAssessment
     my $assessCmdsFile = "$resultsDir/assessCmds$id.sh";
 
     my ($ccCmd, $cxxCmd) = WriteCpptestAssessCmdsFile($data, $assessCmdsFile, $cpptestscanCmdPath,
-			$toolPath, $localsettingsFile, $bdfFile, $projName, $testConfig, $jvmOpts,
-			$workspaceDir, $reportDir, $resultsDir);
+			$toolPath, $toolMajorVersion, $localsettingsFile, $bdfFile, $projName,
+			$testConfig, $jvmOpts, $workspaceDir, $reportDir, $resultsDir);
     my $gccPath = $ccCmd;
     $gccPath = $cxxCmd unless defined $ccCmd;
     die "gcc command not found" unless defined $gccPath;
@@ -4200,21 +4267,47 @@ sub DoParasoftCtestAssessment
     my $gccBits = $data->{cmdInfo}{$gccPath}{bits};
     my $gccFamily;
     if ($gccVersion =~ /^(\d+)\.(\d+)/)  {
-	$gccFamily = "gcc_${1}_${2}";
+	$gccFamily = "gcc_${1}";
+	# only major version if >= 5.0.0
+	$gccFamily .= "_${2}" if $1 <= 4;
 	$gccFamily .= "-64" if $gccBits == 64;
     }  else  {
 	die "Unknown gcc version format: $gccVersion";
     }
 
+    my ($dtpServer, $dtpPort, $dtpUser, $dtpPassword);	#jk
     open LOCALSETTINGS, ">", $localsettingsPath or die "open >$localsettingsFile: $!";
-    print LOCALSETTINGS <<EOF;
+    if ($toolMajorVersion <= 9)  {
+	my $ctestLicenseHost = $toolOptions{'tool-ps-ctest-license-host'};
+	my $ctestLicensePort = $toolOptions{'tool-ps-ctest-license-port'};
+
+	print LOCALSETTINGS <<EOF;
 bdf.import.location = $projDir
 bdf.import.compiler.family = $gccFamily
-cpptest.license.use_network = true
+cpptest.license.use_network = $licenseUseNetwork
 cpptest.license.network.host = $ctestLicenseHost
 cpptest.license.network.port = $ctestLicensePort
-cpptest.license.network.edition = server_edition
+cpptest.license.network.edition = $licenseNetworkEdition
 EOF
+    }  else  {
+	my $dtpServer = $toolOptions{'tool-ps-ctest-dtp-server'};
+	my $dtpPort = $toolOptions{'tool-ps-ctest-dtp-port'};
+	my $dtpUser = $toolOptions{'tool-ps-ctest-dtp-user'};
+	my $dtpPassword = $toolOptions{'tool-ps-ctest-dtp-password'};
+	my $reportFormat = $toolOptions{'tool-ps-ctest-report-format'};
+
+	print LOCALSETTINGS <<EOF;
+cpptest.compiler.family = $gccFamily
+cpptest.license.use_network = $licenseUseNetwork
+cpptest.license.network.type = $licenseNetworkType
+cpptest.license.network.edition = $licenseNetworkEdition
+dtp.server = $dtpServer
+dtp.port =  $dtpPort
+dtp.user = $dtpUser
+dtp.password = $dtpPassword
+report.format = $reportFormat
+EOF
+    }
     close LOCALSETTINGS or die "close $localsettingsPath: $!";
 
     my @cmd = ($assessCmdsFile);
