@@ -26,7 +26,7 @@ use Cwd;
 use Time::HiRes qw( gettimeofday );
 use Data::Dumper;
 
-my $buildBugVersion = '1.1.11 (Dec 08, 2017)';
+my $buildBugVersion = '1.1.12 (Dec 13, 2017)';
 my $fwName = 'c-assess';
 my $fwVersion = $buildBugVersion;
 $fwVersion =~ s/ .*$//;
@@ -772,7 +772,7 @@ sub GetArgN
     my $v = $args->{value}[$position];
 
     if ($type eq 'string')  {
-	die unless $v->{type} =~ /^string(-incomplete)?$/;
+	die unless $v->{type} =~ /^(string(-incomplete)?|expr)$/;
 	$value = $v->{value};
 	$incomplete = $v->{type} ne 'string';
     }  elsif ($type eq 'uint')  {
@@ -828,17 +828,30 @@ sub GetArrayIndexOrigText
 }
 
 
+sub StraceParseErrorMsg
+{
+    my ($cmd, $msg) = @_;
+
+    my ($filename, $lineNum, $ts) = @{$cmd}{qw/filename lineNum ts/};
+    
+    my $errorMsg = "ERROR parsing strace line at $filename:$lineNum (ts=$ts): $msg";
+
+    return $errorMsg;
+}
+
+
 sub GetExecveArgs
 {
     my $cmd = shift;
 
     my ($path, $args, $envs);
     my ($incomplete, $argsIncomplete, $envsIncomplete);
-    die unless $cmd->{cmdName} eq 'execve';
+    my $cmdName = $cmd->{cmdName};
+    die StraceParseErrorMsg($cmd, "expected syscall execve, got $cmdName") unless $cmdName eq 'execve';
     my $cmdArgs = $cmd->{cmdArgs};
-    die unless @{$cmdArgs->{value}} eq 3;
+    die StraceParseErrorMsg($cmd, "execve() requires 3 arguments") unless @{$cmdArgs->{value}} == 3;
     ($path, $incomplete) = GetArgN($cmdArgs, 0, 'string');
-    die if $incomplete;
+    die StraceParseErrorMsg($cmd, "execve() path is not a string ($path)") if $incomplete;
     ($args, $argsIncomplete) = GetArgN($cmdArgs, 1, 'array-string');
     ($envs, $envsIncomplete) = GetArgN($cmdArgs, 2, 'array-string');
 
@@ -906,7 +919,7 @@ sub ProcessSysCalls
     }
 
     my $procs = $data->{procs};
-    die "pid/tid ($tid) in strace ($cmd->{filename}:$cmd->{lineNum}), but not created from a fork/vfork/clone call"
+    die StraceParseErrorMsg($cmd, "pid/tid ($tid) found, but not created from a fork/vfork/clone call")
 	    if $type ne 'exited' && %$procs && !exists $procs->{$tid};
     if ($type eq 'syscall')  {
 	return if defined $cmd->{cmdErrno};
@@ -934,7 +947,7 @@ sub ProcessSysCalls
 	    DestroyThreads($procs, $p, $pid);
 	    my $eid = ++$data->{numEids};
 	    my $peid = $p->{curEid};
-	    $data->{eids}{$peid}{stopTs} = $ts if exists $data->{eids}{$peid};
+	    $data->{eids}{$peid}{stopTs} = $ts if exists $data->{eids}{$peid} && $data->{eids}{$peid}{pid} == $pid;
 	    $data->{rootEid} = $eid if $peid == '0';
 	    my ($path, $args, $envs, $argsIncomplete, $envsIncomplete) = GetExecveArgs($cmd);
 	    my $e = {
@@ -957,12 +970,12 @@ sub ProcessSysCalls
 	    push @{$data->{eids}{$peid}{childEids}}, $eid if exists $data->{eids}{$peid};
 	    my $absPath = MakeAbsPath($e->{startCwd}, $path);
 	    ++$data->{cmdPaths}{$absPath};
-	    die "incomplete execve arg list seen at ts=$ts" if $argsIncomplete;
-	    print STDERR "WARNING: Incomplete ($envsIncomplete) execve env list seen at ts=$ts\n"
+	    die StraceParseErrorMsg($cmd, "incomplete execve arg list") if $argsIncomplete;
+	    print STDERR StraceParseErrorMsg($cmd, "Incomplete execve env list\n")
 		    if $envsIncomplete;	#jk
 	}  elsif ($cmdName eq 'vfork' || $cmdName eq 'clone' || $cmdName eq 'fork')  {
 	    my $newTid = $cmd->{cmdResult};
-	    die "pid ($newTid) returned from $cmdName was previously created, but has not exited"
+	    die StraceParseErrorMsg($cmd, "pid ($newTid) returned from $cmdName was previously created, but has not exited")
 		    if exists $procs->{$newTid};
 	    my $p = $procs->{$tid};
 	    my $cloneFlags = {};
@@ -1042,11 +1055,11 @@ sub ProcessSysCalls
 		if ($relFd eq 'AT_FDCWD')  {
 		    $relToPath = ${$p->{curCwd}};
 		}  elsif ($relFd =~ /^\d+$/)  {
-		    die "openat uses fd '$relFd' that is not open"
+		    die StraceParseErrorMsg($cmd, "openat uses fd '$relFd' that is not open")
 			    unless defined $p->{openFds}{$relFd};
 		    $relToPath = $p->{openFds}{$relFd};
 		}  else  {
-		    die "openat: bad rel fd format '$relFd'";
+		    die StraceParseErrorMsg($cmd, "openat: bad rel fd format '$relFd'");
 		}
 	    }  else  {
 		$pathPos = 0;
@@ -1054,7 +1067,7 @@ sub ProcessSysCalls
 	    }
 	    my ($path, $incomplete) = GetArgN($cmd->{cmdArgs}, $pathPos, 'string');
 	    my $cmdResult = $cmd->{cmdResult};
-	    die "in open/create/openat path '$path' is incomplete" if $incomplete;
+	    die StraceParseErrorMsg($cmd, "in open/create/openat path '$path' is incomplete") if $incomplete;
 	    $p->{openFds}{$cmdResult} = MakeAbsPath($relToPath, $path);
 	}  elsif ($cmdName eq 'close')  {
 	    my $p = $procs->{$tid};
@@ -1078,12 +1091,12 @@ sub ProcessSysCalls
 	}  elsif ($cmdName eq 'chdir')  {
 	    my $p = $procs->{$tid};
 	    my ($path, $incomplete) = GetArgN($cmd->{cmdArgs}, 0, 'string');
-	    die if $incomplete;
+	    die StraceParseErrorMsg($cmd, "chdir argument is not a string") if $incomplete;
 	    ${$p->{curCwd}} = MakeAbsPath(${$p->{curCwd}}, $path);
 	}  elsif ($cmdName eq 'fchdir')  {
 	    my $p = $procs->{$tid};
 	    my ($fd) = GetArgN($cmd->{cmdArgs}, 0, 'uint');
-	    die unless defined $p->{openFds}{$fd};
+	    die StraceParseErrorMsg($cmd, "fchdir fd=$fd is not open") unless defined $p->{openFds}{$fd};
 	    ${$p->{curCwd}} = $p->{openFds}{$fd};
 	}  elsif ($cmdName =~ /^wait(4|pid)$/)  {
 	    my $waitedPid = $cmd->{cmdResult};
@@ -1168,7 +1181,7 @@ sub ProcessSysCalls
     }  elsif ($type eq 'exited')  {
 	# do nothing
     }  else  {
-	die "Unknown strace type '$type'";
+	die StraceParseErrorMsg($cmd, "Unknown strace type '$type'");
     }
 }
 
@@ -2413,11 +2426,17 @@ sub PrintExecTree
     $level = 0 unless defined $level;
     my $e = $eids->{$eid};
     my $exitStatus = $e->{exitStatus};
-    if (!defined $exitStatus)  {
-	$exitStatus = "$e->{exitSignal}";
-	$exitStatus =~ s/^SIG//;
+    my $dur;
+    if (defined $e->{stopTs})  {
+	if (!defined $exitStatus)  {
+	    $exitStatus = $e->{exitSignal};
+	    $exitStatus =~ s/^SIG//;
+	}
+	$dur = DiffTs($e->{startTs}, $e->{stopTs});
+    }  else  {
+	$exitStatus = "<none>";
+	$dur = "<none>";
     }
-    my $dur = DiffTs($e->{startTs}, $e->{stopTs});
     my $cmd = '';
     $cmd .= "[$e->{cmdPath}] " unless $e->{cmdPath} eq $e->{startArgs}[0];
     $cmd .= GetCmdString($e->{startArgs});
@@ -2588,7 +2607,9 @@ sub PrintDebugInfo
     foreach my $e (@{$data->{execs}})  {
 	my $exitStatus = $e->{exitStatus};
 	$exitStatus = $e->{exitSignal} unless defined $exitStatus;
-	my $dur = DiffTs($e->{startTs}, $e->{stopTs});
+	$exitStatus = "<unknown>" unless defined $exitStatus;
+	my $dur = "<unknown>";
+	$dur = DiffTs($e->{startTs}, $e->{stopTs}) if defined $e->{startTs} && defined $e->{stopTs};
 	printf $outFH "%8s %8s %13s %s  = %s     cwd=%s\n", $e->{peid}, $e->{eid}, $dur,
 		$e->{cmdPath}, $exitStatus, $e->{startCwd};
     }

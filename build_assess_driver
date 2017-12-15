@@ -26,7 +26,7 @@ use Getopt::Long;
 use Time::HiRes qw( gettimeofday );
 
 
-my $buildAssessDriverVersion = '1.1.11 (Dec 08, 2017)';
+my $buildAssessDriverVersion = '1.1.13 (Dec 13, 2017)';
 my %options;
 my $statusFile;
 
