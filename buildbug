@@ -26,7 +26,7 @@ use Cwd;
 use Time::HiRes qw( gettimeofday );
 use Data::Dumper;
 
-my $buildBugVersion = '1.1.10 (Nov 06, 2017)';
+my $buildBugVersion = '1.1.11 (Dec 08, 2017)';
 my $fwName = 'c-assess';
 my $fwVersion = $buildBugVersion;
 $fwVersion =~ s/ .*$//;
@@ -775,11 +775,16 @@ sub GetArgN
 	die unless $v->{type} =~ /^string(-incomplete)?$/;
 	$value = $v->{value};
 	$incomplete = $v->{type} ne 'string';
-    }  elsif ($type eq 'int')  {
+    }  elsif ($type eq 'uint')  {
 	die unless $v->{type} eq 'expr';
 	$value = $v->{value};
 	$incomplete = 0;
 	die unless $value =~ /^\d+$/;
+    }  elsif ($type eq 'int')  {
+	die unless $v->{type} eq 'expr';
+	$value = $v->{value};
+	$incomplete = 0;
+	die unless $value =~ /^-?\d+$/;
     }  elsif ($type eq 'expr')  {
 	die unless $v->{type} eq 'expr';
 	$value = $v->{value};
@@ -916,7 +921,7 @@ sub ProcessSysCalls
 			    curEid	=> $data->{numEids},
 			    startTs	=> $ts,
 			    curCwd	=> \$d,
-			    curOpenFds	=> {},
+			    openFds	=> {},
 			    execs	=> [],
 			    threads	=> { $tid => 1 }
 			    }
@@ -925,7 +930,7 @@ sub ProcessSysCalls
 	    my $pid = $t->{pid};
 	    my $p = ($pid != $tid) ? $t : $procs->{$pid};
 	    ${$p->{curCwd}} = ${$t->{curCwd}};
-	    $p->{curOpenFds} = $t->{curOpenFds};
+	    $p->{openFds} = $t->{openFds};
 	    DestroyThreads($procs, $p, $pid);
 	    my $eid = ++$data->{numEids};
 	    my $peid = $p->{curEid};
@@ -957,7 +962,7 @@ sub ProcessSysCalls
 		    if $envsIncomplete;	#jk
 	}  elsif ($cmdName eq 'vfork' || $cmdName eq 'clone' || $cmdName eq 'fork')  {
 	    my $newTid = $cmd->{cmdResult};
-	    die "pid ($newTid) returned from $cmdName, was previously created, but did not exit"
+	    die "pid ($newTid) returned from $cmdName was previously created, but has not exited"
 		    if exists $procs->{$newTid};
 	    my $p = $procs->{$tid};
 	    my $cloneFlags = {};
@@ -982,9 +987,9 @@ sub ProcessSysCalls
 	    }
 	    $newP->{threads}{$newTid} = 1;
 	    if ($cloneFlags->{CLONE_FILES})  {
-		$newP->{curOpenFds} = $p->{curOpenFds};
+		$newP->{openFds} = $p->{openFds};
 	    }  else  {
-		%{$newP->{curOpenFds}} = ( %{$p->{curOpenFds}} );
+		%{$newP->{openFds}} = ( %{$p->{openFds}} );
 	    }
 	    if ($cloneFlags->{CLONE_FS})  {
 		$newP->{curCwd} = $p->{curCwd};
@@ -993,16 +998,18 @@ sub ProcessSysCalls
 	    }
 	}  elsif ($cmdName eq 'exit_group' || $cmdName eq '_exit')  {
 	    my ($exitStatus) = GetArgN($cmd->{cmdArgs}, 0, 'int');
+	    $exitStatus %= 256;
 	    my $t = $procs->{$tid};
 	    my $pid = $t->{pid};
-	    my $p = ($pid != $tid) ? $t : $procs->{$pid};
+	    my $p = ($pid == $tid) ? $t : $procs->{$pid};
 	    if ($cmdName eq 'exit_group')  {
 		DestroyThreads($procs, $p, $pid);
 		delete $p->{threads}{$pid};
 	    }  else  {
 		delete $p->{threads}{$tid};
+		delete $procs->{$tid} if $tid != $pid;
 	    }
-	    if ((scalar keys %{$p->{threads}}) == 0)  {
+	    if (!%{$p->{threads}})  {
 		my $e = $data->{eids}{$p->{curEid}};
 		$p->{exitStatus} = $exitStatus;
 		$e->{exitStatus} = $exitStatus;
@@ -1023,8 +1030,8 @@ sub ProcessSysCalls
 		$p->{curCwd} = \$d;
 	    }
 	    if ($cloneFlags->{CLONE_FILES})  {
-		my %fds = (%{$p->{curOpenFds}});
-		$p->{curOpenFds} = \%fds;
+		my %fds = (%{$p->{openFds}});
+		$p->{openFds} = \%fds;
 	    }
 	}  elsif ($cmdName =~ /^(open|openat|creat)$/)  {
 	    my $p = $procs->{$tid};
@@ -1051,19 +1058,19 @@ sub ProcessSysCalls
 	    $p->{openFds}{$cmdResult} = MakeAbsPath($relToPath, $path);
 	}  elsif ($cmdName eq 'close')  {
 	    my $p = $procs->{$tid};
-	    my ($fd) = GetArgN($cmd->{cmdArgs}, 0, 'int');
+	    my ($fd) = GetArgN($cmd->{cmdArgs}, 0, 'uint');
 	    delete $p->{openFds}{$fd};
 	}  elsif ($cmdName =~ /^dup[23]?$/)  {
 	    my $p = $procs->{$tid};
 	    my $cmdResult = $cmd->{cmdResult};
-	    my ($fd) = GetArgN($cmd->{cmdArgs}, 0, 'int');
+	    my ($fd) = GetArgN($cmd->{cmdArgs}, 0, 'uint');
 	    if (defined $p->{openFds}{$fd})  {
 		$p->{openFds}{$cmdResult} = $p->{openFds}{$fd};
 	    }
 	}  elsif ($cmdName =~ /^fcntl(64)?$/)  {
 	    my $p = $procs->{$tid};
 	    my $cmdResult = $cmd->{cmdResult};
-	    my ($fd) = GetArgN($cmd->{cmdArgs}, 0, 'int');
+	    my ($fd) = GetArgN($cmd->{cmdArgs}, 0, 'uint');
 	    my ($opts) = GetArgN($cmd->{cmdArgs}, 1, 'expr');
 	    if (defined $p->{openFds}{$fd} && $opts =~ /^F_DUPFD(_CLOEXEC)?$/)  {
 		$p->{openFds}{$cmdResult} = $p->{openFds}{$fd};
@@ -1075,7 +1082,7 @@ sub ProcessSysCalls
 	    ${$p->{curCwd}} = MakeAbsPath(${$p->{curCwd}}, $path);
 	}  elsif ($cmdName eq 'fchdir')  {
 	    my $p = $procs->{$tid};
-	    my ($fd) = GetArgN($cmd->{cmdArgs}, 0, 'int');
+	    my ($fd) = GetArgN($cmd->{cmdArgs}, 0, 'uint');
 	    die unless defined $p->{openFds}{$fd};
 	    ${$p->{curCwd}} = $p->{openFds}{$fd};
 	}  elsif ($cmdName =~ /^wait(4|pid)$/)  {
@@ -2037,17 +2044,17 @@ sub GetFirstLineVersion
 {
     my ($path, $versionOpt) = @_;
 
-    my $cmd = "$path $versionOpt";
+    my @cmd = ($path, $versionOpt);
     my $version;
     
-    open AR, "$cmd|" or die "open $cmd: $!";
-    while (<AR>)  {
+    open VER, "-|", @cmd or die "open cmd (@cmd): $!";
+    while (<VER>)  {
 	if (!defined $version)  {
 	    chomp;
 	    $version = $_;
 	}
     }
-    close AR or die "close ($?) $cmd: $!";
+    close VER or die "close cmd (@cmd) status=$?: $!";
 
     my %o = ( version => $version );
 
