@@ -1,4 +1,9 @@
 -------------------------------------
+C-assess  version 1.1.14 (Dec 20, 2017)
+-------------------------------------
+- change the default options for running coverity
+
+-------------------------------------
 C-assess  version 1.1.13 (Dec 15, 2017)
 -------------------------------------
 - detect license acquisition failures for ps-ctest 10

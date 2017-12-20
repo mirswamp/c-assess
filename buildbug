@@ -26,7 +26,7 @@ use Cwd;
 use Time::HiRes qw( gettimeofday );
 use Data::Dumper;
 
-my $buildBugVersion = '1.1.13 (Dec 15, 2017)';
+my $buildBugVersion = '1.1.14 (Dec 20, 2017)';
 my $fwName = 'c-assess';
 my $fwVersion = $buildBugVersion;
 $fwVersion =~ s/ .*$//;
@@ -919,12 +919,65 @@ sub ProcessSysCalls
     }
 
     my $procs = $data->{procs};
-    die StraceParseErrorMsg($cmd, "pid/tid ($tid) found, but not created from a fork/vfork/clone call")
+    die StraceParseErrorMsg($cmd, "pid/tid ($tid) found, but not an active TID (already destroyed or not created from a fork/vfork/clone call)")
 	    if $type ne 'exited' && %$procs && !exists $procs->{$tid};
     if ($type eq 'syscall')  {
 	return if defined $cmd->{cmdErrno};
 	my $cmdName = $cmd->{cmdName};
-	if ($cmdName eq 'execve')  {
+
+	if ($cmdName =~ /^(open|openat|creat)$/)  {
+	    my $p = $procs->{$tid};
+	    my ($pathPos, $relToPath);
+	    if ($cmdName eq 'openat')  {
+		$pathPos = 1;
+		my ($relFd) = GetArgN($cmd->{cmdArgs}, 0, 'expr');
+		if ($relFd eq 'AT_FDCWD')  {
+		    $relToPath = ${$p->{curCwd}};
+		}  elsif ($relFd =~ /^\d+$/)  {
+		    die StraceParseErrorMsg($cmd, "openat uses fd '$relFd' that is not open")
+			    unless defined $p->{openFds}{$relFd};
+		    $relToPath = $p->{openFds}{$relFd};
+		}  else  {
+		    die StraceParseErrorMsg($cmd, "openat: bad rel fd format '$relFd'");
+		}
+	    }  else  {
+		$pathPos = 0;
+		$relToPath = ${$p->{curCwd}};
+	    }
+	    my ($path, $incomplete) = GetArgN($cmd->{cmdArgs}, $pathPos, 'string');
+	    my $cmdResult = $cmd->{cmdResult};
+	    die StraceParseErrorMsg($cmd, "in open/create/openat path '$path' is incomplete") if $incomplete;
+	    $p->{openFds}{$cmdResult} = MakeAbsPath($relToPath, $path);
+	}  elsif ($cmdName eq 'close')  {
+	    my $p = $procs->{$tid};
+	    my ($fd) = GetArgN($cmd->{cmdArgs}, 0, 'uint');
+	    delete $p->{openFds}{$fd};
+	}  elsif ($cmdName =~ /^fcntl(64)?$/)  {
+	    my $p = $procs->{$tid};
+	    my $cmdResult = $cmd->{cmdResult};
+	    my ($fd) = GetArgN($cmd->{cmdArgs}, 0, 'uint');
+	    my ($opts) = GetArgN($cmd->{cmdArgs}, 1, 'expr');
+	    if (defined $p->{openFds}{$fd} && $opts =~ /^F_DUPFD(_CLOEXEC)?$/)  {
+		$p->{openFds}{$cmdResult} = $p->{openFds}{$fd};
+	    }
+	}  elsif ($cmdName =~ /^dup[23]?$/)  {
+	    my $p = $procs->{$tid};
+	    my $cmdResult = $cmd->{cmdResult};
+	    my ($fd) = GetArgN($cmd->{cmdArgs}, 0, 'uint');
+	    if (defined $p->{openFds}{$fd})  {
+		$p->{openFds}{$cmdResult} = $p->{openFds}{$fd};
+	    }
+	}  elsif ($cmdName eq 'chdir')  {
+	    my $p = $procs->{$tid};
+	    my ($path, $incomplete) = GetArgN($cmd->{cmdArgs}, 0, 'string');
+	    die StraceParseErrorMsg($cmd, "chdir argument is not a string") if $incomplete;
+	    ${$p->{curCwd}} = MakeAbsPath(${$p->{curCwd}}, $path);
+	}  elsif ($cmdName eq 'fchdir')  {
+	    my $p = $procs->{$tid};
+	    my ($fd) = GetArgN($cmd->{cmdArgs}, 0, 'uint');
+	    die StraceParseErrorMsg($cmd, "fchdir fd=$fd is not open") unless defined $p->{openFds}{$fd};
+	    ${$p->{curCwd}} = $p->{openFds}{$fd};
+	}  elsif ($cmdName eq 'execve')  {
 	    if (!%$procs)  {
 		my $d = $data->{initialCwd};
 		$procs->{$tid} = {
@@ -1009,6 +1062,18 @@ sub ProcessSysCalls
 	    }  else  {
 		${$newP->{curCwd}} = ${$p->{curCwd}};
 	    }
+	}  elsif ($cmdName eq 'unshare')  {
+	    my $p = $procs->{$tid};
+	    my ($flags) = GetArgN($cmd->{cmdArgs}, 0, 'expr');
+	    my $cloneFlags = ParseCloneFlags($flags);
+	    if ($cloneFlags->{CLONE_FS})  {
+		my $d = ${$p->{curCwd}};
+		$p->{curCwd} = \$d;
+	    }
+	    if ($cloneFlags->{CLONE_FILES})  {
+		my %fds = (%{$p->{openFds}});
+		$p->{openFds} = \%fds;
+	    }
 	}  elsif ($cmdName eq 'exit_group' || $cmdName eq '_exit')  {
 	    my ($exitStatus) = GetArgN($cmd->{cmdArgs}, 0, 'int');
 	    $exitStatus %= 256;
@@ -1034,70 +1099,6 @@ sub ProcessSysCalls
 		}
 		delete $procs->{$pid};
 	    }
-	}  elsif ($cmdName eq 'unshare')  {
-	    my $p = $procs->{$tid};
-	    my ($flags) = GetArgN($cmd->{cmdArgs}, 0, 'expr');
-	    my $cloneFlags = ParseCloneFlags($flags);
-	    if ($cloneFlags->{CLONE_FS})  {
-		my $d = ${$p->{curCwd}};
-		$p->{curCwd} = \$d;
-	    }
-	    if ($cloneFlags->{CLONE_FILES})  {
-		my %fds = (%{$p->{openFds}});
-		$p->{openFds} = \%fds;
-	    }
-	}  elsif ($cmdName =~ /^(open|openat|creat)$/)  {
-	    my $p = $procs->{$tid};
-	    my ($pathPos, $relToPath);
-	    if ($cmdName eq 'openat')  {
-		$pathPos = 1;
-		my ($relFd) = GetArgN($cmd->{cmdArgs}, 0, 'expr');
-		if ($relFd eq 'AT_FDCWD')  {
-		    $relToPath = ${$p->{curCwd}};
-		}  elsif ($relFd =~ /^\d+$/)  {
-		    die StraceParseErrorMsg($cmd, "openat uses fd '$relFd' that is not open")
-			    unless defined $p->{openFds}{$relFd};
-		    $relToPath = $p->{openFds}{$relFd};
-		}  else  {
-		    die StraceParseErrorMsg($cmd, "openat: bad rel fd format '$relFd'");
-		}
-	    }  else  {
-		$pathPos = 0;
-		$relToPath = ${$p->{curCwd}};
-	    }
-	    my ($path, $incomplete) = GetArgN($cmd->{cmdArgs}, $pathPos, 'string');
-	    my $cmdResult = $cmd->{cmdResult};
-	    die StraceParseErrorMsg($cmd, "in open/create/openat path '$path' is incomplete") if $incomplete;
-	    $p->{openFds}{$cmdResult} = MakeAbsPath($relToPath, $path);
-	}  elsif ($cmdName eq 'close')  {
-	    my $p = $procs->{$tid};
-	    my ($fd) = GetArgN($cmd->{cmdArgs}, 0, 'uint');
-	    delete $p->{openFds}{$fd};
-	}  elsif ($cmdName =~ /^dup[23]?$/)  {
-	    my $p = $procs->{$tid};
-	    my $cmdResult = $cmd->{cmdResult};
-	    my ($fd) = GetArgN($cmd->{cmdArgs}, 0, 'uint');
-	    if (defined $p->{openFds}{$fd})  {
-		$p->{openFds}{$cmdResult} = $p->{openFds}{$fd};
-	    }
-	}  elsif ($cmdName =~ /^fcntl(64)?$/)  {
-	    my $p = $procs->{$tid};
-	    my $cmdResult = $cmd->{cmdResult};
-	    my ($fd) = GetArgN($cmd->{cmdArgs}, 0, 'uint');
-	    my ($opts) = GetArgN($cmd->{cmdArgs}, 1, 'expr');
-	    if (defined $p->{openFds}{$fd} && $opts =~ /^F_DUPFD(_CLOEXEC)?$/)  {
-		$p->{openFds}{$cmdResult} = $p->{openFds}{$fd};
-	    }
-	}  elsif ($cmdName eq 'chdir')  {
-	    my $p = $procs->{$tid};
-	    my ($path, $incomplete) = GetArgN($cmd->{cmdArgs}, 0, 'string');
-	    die StraceParseErrorMsg($cmd, "chdir argument is not a string") if $incomplete;
-	    ${$p->{curCwd}} = MakeAbsPath(${$p->{curCwd}}, $path);
-	}  elsif ($cmdName eq 'fchdir')  {
-	    my $p = $procs->{$tid};
-	    my ($fd) = GetArgN($cmd->{cmdArgs}, 0, 'uint');
-	    die StraceParseErrorMsg($cmd, "fchdir fd=$fd is not open") unless defined $p->{openFds}{$fd};
-	    ${$p->{curCwd}} = $p->{openFds}{$fd};
 	}  elsif ($cmdName =~ /^wait(4|pid)$/)  {
 	    my $waitedPid = $cmd->{cmdResult};
 	    if (($waitedPid != -1) && exists $procs->{$waitedPid})  {
@@ -2429,13 +2430,17 @@ sub PrintExecTree
     my $dur;
     if (defined $e->{stopTs})  {
 	if (!defined $exitStatus)  {
-	    $exitStatus = $e->{exitSignal};
-	    $exitStatus =~ s/^SIG//;
+	    if (defined $e->{exitSignal})  {
+		$exitStatus = $e->{exitSignal};
+		$exitStatus =~ s/^SIG//;
+	    }  else  {
+		$exitStatus = "???";
+	    }
 	}
 	$dur = DiffTs($e->{startTs}, $e->{stopTs});
     }  else  {
-	$exitStatus = "<none>";
-	$dur = "<none>";
+	$exitStatus = "???";
+	$dur = "???";
     }
     my $cmd = '';
     $cmd .= "[$e->{cmdPath}] " unless $e->{cmdPath} eq $e->{startArgs}[0];
@@ -2620,7 +2625,7 @@ sub PrintDebugInfo
     }
 
     print $outFH "-----\nexec tree hierarchy\n-----\n";
-    PrintExecTree($outFH, $data->{eids}, $data->{rootEid});
+    PrintExecTree($outFH, $data->{eids}, $data->{rootEid}) if defined $data->{eids};
 
     #print $outFH "-----\ndata\n-----\n";
     #print $outFH Dumper($data), "\n";
@@ -5241,8 +5246,8 @@ sub WriteSynopsysCoverityAssessCmdsFile
 {
     my ($data, $filename,
 		$covConfig, $covDataDir,
-		$covConfigure, $covTranslate, $covAnalyze, $covFormatErrors,
-		$jsonOutput, $htmlOutput, $emacsOutput) = @_;
+		$covConfigure, $covTranslate, $covAnalyze, $extraAnalyzeOpts,
+		$covFormatErrors, $jsonOutput, $htmlOutput, $emacsOutput) = @_;
 
     my %buildCommands;
     my $eids = $data->{eids};
@@ -5257,7 +5262,7 @@ sub WriteSynopsysCoverityAssessCmdsFile
     my @covDirOpts	= ('--dir', 	$covDataDir);
     my @covConfigureCmd = ($covConfigure, @covConfigOpts);
     my @covTranslateCmd = ($covTranslate, @covConfigOpts, @covDirOpts);
-    my @covAnalyzeCmd	= ($covAnalyze, @covConfigOpts, @covDirOpts);
+    my @covAnalyzeCmd	= ($covAnalyze, @covConfigOpts, @covDirOpts, @$extraAnalyzeOpts);
     my @covFormatErrorsCmd = ($covFormatErrors, @covDirOpts);
 
     open my $BUILDFILE, ">$filename" or die "open $filename: $!";
@@ -5366,6 +5371,85 @@ sub CheckCoverityLicenseFailure
 }
 
 
+sub GetValue
+{
+    my ($v, $type) = @_;
+    my $value;
+
+    if (defined $type)  {
+	# TODO: Check v against $type
+	$value = $v;
+    }  else  {
+	$value = BoolValue($v);
+    }
+
+    return $value;
+}
+
+
+sub GetToolOpts
+{
+    my ($toolOptNames, $toolOptPrefixes, $toolOptHashes) = @_;
+    my %opts;
+    my @errors;
+
+    OPT: foreach my $o (@$toolOptNames)  {
+	my $name = $o;
+	$name =~ s/=(.*)$//;
+	my $type = $1;
+	$opts{$name} = 0 unless defined $type;	# bool opt
+	foreach my $h (@$toolOptHashes)  {
+	    next unless defined $h;
+	    foreach my $prefix (@$toolOptPrefixes)  {
+		my $k = "$prefix$name";
+		if (exists $h->{$k})  {
+		    my $v = $h->{$k};
+		    $opts{$name} = GetValue($v, $type) unless $v =~ /^\s*$/;
+		    next OPT;
+		}
+	    }
+	}
+    }
+
+    return \%opts;
+}
+
+
+sub GetCoverityAnalyzeOpts
+{
+    my ($opts, $optNames) = @_;
+
+    my @analyzeOpts;
+
+    foreach my $o (@$optNames)  {
+	next if $o =~ /=/;
+	push @analyzeOpts, "--$o" if $opts->{$o};
+    }
+
+    my $k = 'paths';
+    if (HasValue $opts->{$k})  {
+	my $v = $opts->{$k};
+	die "tool-sy-coverity-$k options value '$v' is not a number" unless $v =~ /^\d+$/;
+	push @analyzeOpts, "--$k", $v;
+    }
+
+    $k = 'aggressiveness-level';
+    if (HasValue $opts->{$k})  {
+	my $v = $opts->{$k};
+	my $validRe = 'low|medium|high';
+	die "tool-sy-coverity-$k options value '$v' is not a $validRe" unless $v =~ /^($validRe)$/;
+	push @analyzeOpts, "--$k", $v;
+    }
+
+    foreach my $o (qw/checker-option enable disable/)  {
+	next unless HasValue $opts->{$o};
+	push @analyzeOpts, map +( "--$o" => $_ ), split ' ', $opts->{$o};
+    }
+
+    return \@analyzeOpts;
+}
+
+
 sub DoSynopsysCoverityAssessment
 {
     my ($data, $toolType, $resultsDir, $toolPath, $toolOpt, $toolConfFile, $toolDir, $servicesConfFile) = @_;
@@ -5377,6 +5461,8 @@ sub DoSynopsysCoverityAssessment
     my $id = 0;
 
     my $toolConf = ReadConfFile($toolConfFile);
+    my $servicesConf;
+    $servicesConf = ReadConfFile($servicesConfFile) if defined $servicesConfFile;
 
     if (defined $toolConf->{'tool-license-file'} && -f $toolConf->{'tool-license-file'})  {
 	use File::Copy;
@@ -5384,8 +5470,7 @@ sub DoSynopsysCoverityAssessment
 	my $to = "$toolDir/" . $toolConf->{'tool-license-dat-file'};
 	copy $license, $to or die "cp $license, $to: $!";
     }  else  {
-	die "--servicesconf file required, but option missing" unless defined $servicesConfFile;
-	my $servicesConf = ReadConfFile($servicesConfFile) if defined $servicesConfFile;
+	die "--servicesconf file required, but option missing" unless defined $servicesConf;
 	my $licenseHost = $servicesConf->{'tool-sy-coverity-license-host'};
 	my $licensePort = $servicesConf->{'tool-sy-coverity-license-port'};
 	my $licenseConfigFile = $toolConf->{'tool-license-config-file'};
@@ -5405,6 +5490,37 @@ sub DoSynopsysCoverityAssessment
 	}
 	WriteFile($licenseConfigFile, "#FLEXnet\nlicense-server $licensePort\@$host\n");
     }
+
+    my @toolOptNames = qw/
+	all
+	concurrency
+	disable-default
+	enable-contraint-fpp
+	enable-exceptions
+	enable-fnptr
+	enable-parse-warnings
+	enable-virtual
+	handle-bad-alloc
+	inherit-taint-from-union
+	preview
+	security
+
+	checker-option=.+
+	enable=.+
+	disable=.+
+	paths=\d+
+	aggressiveness-level=low|medium|high
+	/;
+    my @toolOptPrefixes = qw/ tool-sy-coverity- tool-coverity- /;
+    my %defaultToolOpts = qw/
+	tool-sy-coverity-enable-exceptions	1
+	tool-sy-coverity-enable-fnptr		1
+	tool-sy-coverity-enable-virtual		1
+	tool-sy-coverity-security		1
+	/;
+    my @toolOptHashes = ($servicesConf, $toolConf, \%defaultToolOpts);
+    my $opts = GetToolOpts(\@toolOptNames, \@toolOptPrefixes, \@toolOptHashes);
+    my $extraAnalyzeOpts = GetCoverityAnalyzeOpts($opts, \@toolOptNames);
 
     my $toolVersion = $toolConf->{'tool-version'};
 
@@ -5439,8 +5555,8 @@ sub DoSynopsysCoverityAssessment
 
     WriteSynopsysCoverityAssessCmdsFile($data, $assessCmdsFile,
 				    $covConfig, $covDataDir,
-				    $covConfigure, $covTranslate, $covAnalyze, $covFormatErrors,
-				    $jsonOutput, $htmlOutput, $emacsOutput);
+				    $covConfigure, $covTranslate, $covAnalyze, $extraAnalyzeOpts,
+				    $covFormatErrors, $jsonOutput, $htmlOutput, $emacsOutput);
 
     my @cmd = ($assessCmdsFile);
 
