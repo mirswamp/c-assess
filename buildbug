@@ -26,7 +26,7 @@ use Cwd;
 use Time::HiRes qw( gettimeofday );
 use Data::Dumper;
 
-my $buildBugVersion = '1.1.12 (Dec 13, 2017)';
+my $buildBugVersion = '1.1.13 (Dec 15, 2017)';
 my $fwName = 'c-assess';
 my $fwVersion = $buildBugVersion;
 $fwVersion =~ s/ .*$//;
@@ -833,7 +833,7 @@ sub StraceParseErrorMsg
     my ($cmd, $msg) = @_;
 
     my ($filename, $lineNum, $ts) = @{$cmd}{qw/filename lineNum ts/};
-    
+
     my $errorMsg = "ERROR parsing strace line at $filename:$lineNum (ts=$ts): $msg";
 
     return $errorMsg;
@@ -4093,31 +4093,33 @@ sub WriteCpptestAssessCmdsFile
 
 sub CheckParasoftLicenseFailure
 {
-    my ($exitCode, $stderrPath) = @_;
+    my ($exitCode, $filename) = @_;
 
-    return 0 if $exitCode != 134;
+    # ps-ctest 9 exited with status of 134, but that is not true in ps-ctest 10
+    # return 0 if $exitCode != 134;
 
     my $linenum = 0;
-    my $licenseFailed = 0;
-    my $line;
-    open ERRFILE, "<", $stderrPath or die "open $stderrPath: $!";
-    while (<ERRFILE>)  {
+    my $firstFailedLinenum = 0;
+    my $errorLines;
+    open FILE, "<", $filename or die "open $filename: $!";
+    while (<FILE>)  {
 	++$linenum;
-	if (/Error:\s+No valid license/i)  {
-	    $licenseFailed = 1;
-	    $line = $_;
-	    chomp $line;
-	    last;
+	if (/Error:\s*license|License:\s+Activation failed/i)  {
+	    $firstFailedLinenum = $linenum if $firstFailedLinenum == 0;
+	    $errorLines .= $_;
 	}
     }
-    close ERRFILE or die "close $stderrPath: $!";
+    chomp $errorLines;
+    close FILE or die "close $filename: $!";
 
-    if ($licenseFailed)  {
-	print STDERR "Parasoft license acquire failed at $stderrPath line $linenum:\n\t$line\n";
-	$@ = LogStatus('assess-acquire-license', '', 1, undef, "$stderrPath:$linenum:  $line");
+    if ($firstFailedLinenum != 0)  {
+	$@ = LogStatus('assess-acquire-license', '', 1, undef, "From file $filename line $linenum:\n$errorLines");
+	$errorLines =~ s/^/\t/mg;
+	print STDERR "Parasoft license acquire failed at $filename line $linenum:\n$errorLines\n";
+	return 1;
     }
 
-    return $licenseFailed;
+    return 0;
 }
 
 
@@ -4342,25 +4344,35 @@ EOF
 
     print STDERR GetCmdString(\@cmd), "\n";
 
+    # ps-ctest 10 does not always exit non-0 on failure, so also check for output XML file
+    my $resultFileName = "report.xml";
+    my $resultFullFilePath = "$reportDir/$resultFileName";
+
     my $startTs = GetCurTs();
     my ($exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus)
 	    = ExecCmd(\@cmd, undef, undef, $stdoutPath, $stderrPath);
     my $stopTs = GetCurTs();
-    if ($exitStatus == 0)  {
+    if ($exitStatus == 0 && -f $resultFullFilePath)  {
 	++$pass;
     }  else  {
 	++$fail;
-	print STDERR "# Error: ", GetExecErrorMsg(\@cmd, $exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus), "\n";
-	CheckParasoftLicenseFailure($exitCode, $stderrPath);
+	if ($exitStatus != 0)  {
+	    print STDERR "# Error: ", GetExecErrorMsg(\@cmd, $exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus), "\n";
+	}  else  {
+	    print STDERR "# Error: ", GetCmdString(\@cmd), " failed to create $resultFullFilePath\n";
+	}
+	my $licenseFailure = CheckParasoftLicenseFailure($exitCode, $stderrPath);
+	# ps-ctest 10 write license failure to stdout, so check it also if not in stderr
+	CheckParasoftLicenseFailure($exitCode, $stdoutPath) unless $licenseFailure;
 	CheckParasoftCompatibility($exitCode, $stdoutPath);
     }
 
-    my $resultFileName = $reportDir;
-    $resultFileName =~ s/.*\///;
-    $resultFileName .= '/report.xml';
+    my $resultFilePath = $reportDir;
+    $resultFilePath =~ s/.*\///;
+    $resultFilePath .= "/$resultFileName";
 
     print $asFH XmlAssessment($cmd[0], \@cmd, \%ENV, $buildRootDir,
-				$resultFileName, $stdoutFileName, $stderrFileName, $id,
+				$resultFilePath, $stdoutFileName, $stderrFileName, $id,
 				$exitCode, $exitSignalName, $startTs, $stopTs, $indent2);
 
     my $assessStopTs = GetCurTs();
@@ -5257,7 +5269,6 @@ mkdir $covDataDir
 
 
 # Configure compilers
-
 EOF
     foreach my $type (keys %buildCommands)  {
 	next unless $type =~ /^g(cc|\+\+)$/;
