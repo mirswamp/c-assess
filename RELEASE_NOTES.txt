@@ -1,4 +1,9 @@
 -------------------------------------
+C-assess  version 1.1.16 (Mar 06, 2018)
+-------------------------------------
+- fix building with goal=just-build
+
+-------------------------------------
 C-assess  version 1.1.15 (Feb 14, 2018)
 -------------------------------------
 - update to support el-7.x platforms
