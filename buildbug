@@ -3,7 +3,7 @@
 #
 #  buildbug   http://www.cs.wisc.edu/~kupsch
 # 
-#  Copyright 2013-2017 James A. Kupsch
+#  Copyright 2013-2018 James A. Kupsch
 # 
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@ use Cwd;
 use Time::HiRes qw( gettimeofday );
 use Data::Dumper;
 
-my $buildBugVersion = '1.1.14 (Dec 20, 2017)';
+my $buildBugVersion = '1.1.15 (Feb 14, 2018)';
 my $fwName = 'c-assess';
 my $fwVersion = $buildBugVersion;
 $fwVersion =~ s/ .*$//;
@@ -919,7 +919,7 @@ sub ProcessSysCalls
     }
 
     my $procs = $data->{procs};
-    die StraceParseErrorMsg($cmd, "pid/tid ($tid) found, but not an active TID (already destroyed or not created from a fork/vfork/clone call)")
+    die StraceParseErrorMsg($cmd, "pid/tid ($tid) found, but not an active TID (already destroyed or not created by fork/vfork/clone call)")
 	    if $type ne 'exited' && %$procs && !exists $procs->{$tid};
     if ($type eq 'syscall')  {
 	return if defined $cmd->{cmdErrno};
@@ -994,14 +994,24 @@ sub ProcessSysCalls
 	    }
 	    my $t = $procs->{$tid};
 	    my $pid = $t->{pid};
-	    my $p = ($pid != $tid) ? $t : $procs->{$pid};
+	    my $p = $procs->{$pid};
 	    ${$p->{curCwd}} = ${$t->{curCwd}};
 	    $p->{openFds} = $t->{openFds};
 	    DestroyThreads($procs, $p, $pid);
 	    my $eid = ++$data->{numEids};
 	    my $peid = $p->{curEid};
-	    $data->{eids}{$peid}{stopTs} = $ts if exists $data->{eids}{$peid} && $data->{eids}{$peid}{pid} == $pid;
-	    $data->{rootEid} = $eid if $peid == '0';
+	    if ($peid == 0)  {
+		$data->{rootEid} = $eid;
+	    } elsif (exists $data->{eids}{$peid})  {
+		my $pe = $data->{eids}{$peid};
+		push @{$pe->{childEids}}, $eid;
+		if ($pe->{pid} == $pid)  {
+		    $pe->{stopTs} = $ts;
+		    $pe->{nextExecEid} = $eid;
+		}
+	    }  else  {
+		die StraceParseErrorMsg($cmd, "eid '$peid' does not exist");
+	    }
 	    my ($path, $args, $envs, $argsIncomplete, $envsIncomplete) = GetExecveArgs($cmd);
 	    my $e = {
 		    pid		=> $pid,
@@ -1020,7 +1030,6 @@ sub ProcessSysCalls
 	    push @{$p->{execs}}, $e;
 	    push @{$data->{execs}}, $e;
 	    $data->{eids}{$eid} = $e;
-	    push @{$data->{eids}{$peid}{childEids}}, $eid if exists $data->{eids}{$peid};
 	    my $absPath = MakeAbsPath($e->{startCwd}, $path);
 	    ++$data->{cmdPaths}{$absPath};
 	    die StraceParseErrorMsg($cmd, "incomplete execve arg list") if $argsIncomplete;
@@ -1079,7 +1088,7 @@ sub ProcessSysCalls
 	    $exitStatus %= 256;
 	    my $t = $procs->{$tid};
 	    my $pid = $t->{pid};
-	    my $p = ($pid == $tid) ? $t : $procs->{$pid};
+	    my $p = $procs->{$pid};
 	    if ($cmdName eq 'exit_group')  {
 		DestroyThreads($procs, $p, $pid);
 		delete $p->{threads}{$pid};

@@ -3,7 +3,7 @@
 #
 #  build_assess_driver   http://www.cs.wisc.edu/~kupsch
 # 
-#  Copyright 2013-2017 James A. Kupsch
+#  Copyright 2013-2018 James A. Kupsch
 # 
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@ use Getopt::Long;
 use Time::HiRes qw( gettimeofday );
 
 
-my $buildAssessDriverVersion = '1.1.14 (Dec 20, 2017)';
+my $buildAssessDriverVersion = '1.1.15 (Feb 14, 2018)';
 my %options;
 my $statusFile;
 
@@ -1297,13 +1297,31 @@ sub MakeConfigureCmd
 	    'ant'			=> undef,
 	    'ant+ivy'			=> undef,
 	    'maven'			=> undef,
+	    'gradle'                    => undef,
 	    'make'			=> undef,
 	    'configure+make'		=> './configure',
 	    'autotools+configure+make'	=> 'mkdir -p m4 && autoreconf --install --force || ./autogen.sh && ./configure',
 	    'cmake+make'		=> 'cmake .',
 	    'no-build'			=> undef,
 	    'other'			=> undef,
-	    'none'			=> undef
+	    'none'			=> undef,
+            'java-bytecode'             => undef,
+            'android+ant'               => undef,
+            'android+ant+ivy'           => undef,
+            'android+maven'             => undef,
+            'android+gradle'            => undef,
+            'python-distutils'          => undef,
+            'python-setuptools'         => undef,
+            'wheels'                    => undef,
+            'ruby-gem'                  => undef,
+            'bundler'                   => undef,
+            'bundler+rake'              => undef,
+            'bundler+other'             => undef,
+            'rake'                      => undef,
+            'android-apk'               => undef,
+            'npm'                       => undef,
+            'pear'                      => undef,
+            'composer'                  => undef,
 	    );
 	    # gradle java-bytecode python-distutils
 	    # android+ant android+ant+ivy android+maven android+gradle
@@ -1341,13 +1359,31 @@ sub MakeBuildCmd
 	    'ant'			=> 'ant',
 	    'ant+ivy'			=> 'ant',
 	    'maven'			=> 'mvn',
+	    'gradle'			=> 'gradle',
 	    'make'			=> 'make',
 	    'configure+make'		=> 'make',
 	    'autotools+configure+make'	=> 'make',
 	    'cmake+make'		=> 'make',
 	    'no-build'			=> 'make',
 	    'other'			=> undef,
-	    'none'			=> undef
+	    'none'			=> undef,
+            'java-bytecode'             => undef,
+            'android+ant'               => 'ant',
+            'android+ant+ivy'           => 'ant',
+            'android+maven'             => 'mvn',
+            'android+gradle'            => 'gradle',
+            'python-distutils'          => 'python -b',
+            'python-setuptools'         => 'python -b',
+            'wheels'                    => 'pip install "$archive" && wheel unpack --dest "${archive}-build" "$archive"',
+            'ruby-gem'                  => 'gem --no-document --user-install install "$archive"',
+            'bundler'                   => '',
+            'bundler+rake'              => 'rake',
+            'bundler+other'             => undef,
+            'rake'                      => 'rake',
+            'android-apk'               => undef,
+            'npm'                       => 'npm install',
+            'pear'                      => 'pear install --alldeps',
+            'composer'                  => 'php composer.phar install --no-interaction --no-progress',
 	    );
 	    # gradle java-bytecode python-distutils
 	    # android+ant android+ant+ivy android+maven android+gradle

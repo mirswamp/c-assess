@@ -1,4 +1,9 @@
 -------------------------------------
+C-assess  version 1.1.15 (Feb 14, 2018)
+-------------------------------------
+- update to support el-7.x platforms
+
+-------------------------------------
 C-assess  version 1.1.14 (Dec 20, 2017)
 -------------------------------------
 - change the default options for running coverity
