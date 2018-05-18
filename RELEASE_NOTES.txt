@@ -1,4 +1,9 @@
 -------------------------------------
+C-assess  version 1.1.18 (May 01, 2018)
+-------------------------------------
+- add support for arm cross compiler toolchain (arm-none-eabi)
+
+-------------------------------------
 C-assess  version 1.1.17 (Apr 23, 2018)
 -------------------------------------
 - add support for setting clang-sa analysis options

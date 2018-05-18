@@ -26,7 +26,7 @@ use Cwd;
 use Time::HiRes qw( gettimeofday );
 use Data::Dumper;
 
-my $buildBugVersion = '1.1.17 (Apr 23, 2018)';
+my $buildBugVersion = '1.1.18 (May 01, 2018)';
 my $fwName = 'c-assess';
 my $fwVersion = $buildBugVersion;
 $fwVersion =~ s/ .*$//;
@@ -1586,6 +1586,9 @@ sub BuildExecType
 	    }
 	}
     }
+
+    # remove prefix from arm cross compiler tools
+    $path =~ s/^arm-none-eabi-//;
     
     my $type = '';
     if ($path =~ /^g?cc$/)  {
@@ -3731,7 +3734,7 @@ sub GetClangSaOpts
 	my $k = $o;
 	$k =~ s/^--?//;
 	if (exists $opts->{$k})  {
-	    my @v = split /\s+/, $opts->{$k};
+	    my @v = split ' ', $opts->{$k};
 	    push @args, map {$o => $_} @v;
 	}
     }
@@ -3764,7 +3767,6 @@ sub DoClangSaAssessment
     my $servicesConf;
     $servicesConf = ReadConfFile($servicesConfFile) if defined $servicesConfFile;
 
-####
     my @toolOptNames = qw/
 	analyze-headers
 	enable-checker=.*
@@ -3780,7 +3782,6 @@ sub DoClangSaAssessment
     my @toolOptHashes = ($servicesConf, $toolConf, \%defaultToolOpts);
     my $opts = GetToolOpts(\@toolOptNames, \@toolOptPrefixes, \@toolOptHashes);
     my $extraOpts = GetClangSaOpts($opts);
-####
 
     my $asFile = "$resultsDir/assessment_summary.xml";
     open my $asFH, ">", $asFile or die "open $asFile: $!";
