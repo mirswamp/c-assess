@@ -1,6 +1,6 @@
-                             c-assess-test-1.1.4
+                             c-assess-test-1.1.17
                                James A. Kupsch
-                                  2016-10-23
+                                  2018-04-23
 
 This document describes the files that need to be placed in the virtual
 machine's input directory to perform a build, or build and assessment of

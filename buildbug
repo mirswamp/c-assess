@@ -26,7 +26,7 @@ use Cwd;
 use Time::HiRes qw( gettimeofday );
 use Data::Dumper;
 
-my $buildBugVersion = '1.1.16 (Mar 06, 2018)';
+my $buildBugVersion = '1.1.17 (Apr 23, 2018)';
 my $fwName = 'c-assess';
 my $fwVersion = $buildBugVersion;
 $fwVersion =~ s/ .*$//;
@@ -3704,9 +3704,45 @@ sub WriteBuildFile
 }
 
 
+sub GetClangSaOpts
+{
+    my ($opts) = @_;
+
+    my @args;
+
+    my @binOpts = qw/ -analyze-headers /;
+    my @argOpts = qw/ -constraint -maxloop -store -analyzer-config /;
+    my @multiArgOpts = qw/ -enable-checker -disable-checker /;
+
+    foreach my $o (@binOpts)  {
+	my $k = $o;
+	$k =~ s/^--?//;
+	push @args, $o, $opts->{$k} if exists $opts->{$k} && $opts->{$k};
+    }
+    foreach my $o (@argOpts)  {
+	my $k = $o;
+	$k =~ s/^--?//;
+	if (exists $opts->{$k})  {
+	    my $v = $opts->{$k};
+	    push @args, $o, $opts->{$k} if $opts->{$k} ne '';
+	}
+    }
+    foreach my $o (@multiArgOpts)  {
+	my $k = $o;
+	$k =~ s/^--?//;
+	if (exists $opts->{$k})  {
+	    my @v = split /\s+/, $opts->{$k};
+	    push @args, map {$o => $_} @v;
+	}
+    }
+
+    return \@args;
+}
+
+
 sub DoClangSaAssessment
 {
-    my ($data, $toolType, $resultsDir, $toolPath, $toolOpt, $toolConfFile, $toolDir) = @_;
+    my ($data, $toolType, $resultsDir, $toolPath, $toolOpt, $toolConfFile, $toolDir, $servicesConfFile) = @_;
     my ($pass, $fail, $skip) = (0, 0);
     my $uuid = GetUuid();
     my $assessStartTs = GetCurTs();
@@ -3724,6 +3760,27 @@ sub DoClangSaAssessment
     close TOOLVER or die "close $toolPath --version|: $!";
     chomp $toolVersion;
     $toolConf->{'#toolVersionText'} = $toolVersion;
+
+    my $servicesConf;
+    $servicesConf = ReadConfFile($servicesConfFile) if defined $servicesConfFile;
+
+####
+    my @toolOptNames = qw/
+	analyze-headers
+	enable-checker=.*
+	disable-checker=.*
+	analyzer-config=.*
+	constraint=range|basic
+	maxloop=\d+
+	store=region|basic
+	/;
+    my @toolOptPrefixes = qw/ tool-clang-sa- /;
+    my %defaultToolOpts = qw/
+	/;
+    my @toolOptHashes = ($servicesConf, $toolConf, \%defaultToolOpts);
+    my $opts = GetToolOpts(\@toolOptNames, \@toolOptPrefixes, \@toolOptHashes);
+    my $extraOpts = GetClangSaOpts($opts);
+####
 
     my $asFile = "$resultsDir/assessment_summary.xml";
     open my $asFH, ">", $asFile or die "open $asFile: $!";
@@ -3751,6 +3808,7 @@ sub DoClangSaAssessment
 		'-o', $outputDir,
 		'-plist-html',
 		'--keep-empty',
+		@$extraOpts,
 		'--use-analyzer', $clangPath);
     push @cmd, '--use-cc', $ccCmd if defined $ccCmd;
     push @cmd, '--use-c++', $cxxCmd if defined $cxxCmd;
@@ -5603,6 +5661,16 @@ sub DoSynopsysCoverityAssessment
 
 
 
+############################# Programming Research PRQA Framekwork #############################
+
+
+sub DoPrqaFrameworkAssessment
+{
+    die "Not implemented";
+}
+
+
+
 ############################# RedLizard Goanna #############################
 
 
@@ -5843,14 +5911,16 @@ sub DoAssessment
 	($pass, $fail, $skip) = DoGccWarnAssessment(@_);
     }  elsif ($toolType eq 'ps-ctest')  {
 	($pass, $fail, $skip) = DoParasoftCtestAssessment(@_);
-    }  elsif ($toolType eq 'hrl-tif')  {
-	($pass, $fail, $skip) = DoHrlTifAssessment(@_);
     }  elsif ($toolType eq 'gt-csonar' || $toolType eq 'csonar')  {
 	($pass, $fail, $skip) = DoCodeSonarAssessment(@_);
-    }  elsif ($toolType eq 'rl-goanna')  {
-	($pass, $fail, $skip) = DoGoannaAssessment(@_);
     }  elsif ($toolType eq 'coverity')  {
 	($pass, $fail, $skip) = DoSynopsysCoverityAssessment(@_);
+    }  elsif ($toolType eq 'prqa-framework')  {
+	($pass, $fail, $skip) = DoPrqaFrameworkAssessment(@_);
+    }  elsif ($toolType eq 'hrl-tif')  {
+	($pass, $fail, $skip) = DoHrlTifAssessment(@_);
+    }  elsif ($toolType eq 'rl-goanna')  {
+	($pass, $fail, $skip) = DoGoannaAssessment(@_);
     }  else  {
 	die "DoAssessment unknown tooltype ($toolType)";
     }

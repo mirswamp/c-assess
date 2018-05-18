@@ -1,4 +1,10 @@
 -------------------------------------
+C-assess  version 1.1.17 (Apr 23, 2018)
+-------------------------------------
+- add support for setting clang-sa analysis options
+- update install-dependencies scripts
+
+-------------------------------------
 C-assess  version 1.1.16 (Mar 06, 2018)
 -------------------------------------
 - fix building with goal=just-build
