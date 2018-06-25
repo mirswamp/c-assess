@@ -1,4 +1,9 @@
 -------------------------------------
+C-assess  version 1.1.19 (Jun 25, 2018)
+-------------------------------------
+- add support whitespace in package name and version
+
+-------------------------------------
 C-assess  version 1.1.18 (May 01, 2018)
 -------------------------------------
 - add support for arm cross compiler toolchain (arm-none-eabi)

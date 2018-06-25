@@ -26,7 +26,7 @@ use Getopt::Long;
 use Time::HiRes qw( gettimeofday );
 
 
-my $buildAssessDriverVersion = '1.1.18 (May 01, 2018)';
+my $buildAssessDriverVersion = '1.1.19 (Jun 25, 2018)';
 my %options;
 my $statusFile;
 
@@ -1948,9 +1948,9 @@ sub DoRun
 	my $pkgData = ReadConfFile($pkgConfFile);
 	if (defined $buildbugCmd)  {
 	    my $pkgName = $pkgData->{'package-short-name'};
-	    $buildbugCmd = AppendToBashCmd($buildbugCmd, "--pkg-name=$pkgName") if defined $pkgName;
+	    $buildbugCmd = AppendToBashCmd($buildbugCmd, ["--pkg-name=$pkgName"]) if defined $pkgName;
 	    my $pkgVersion = $pkgData->{'package-version'};
-	    $buildbugCmd = AppendToBashCmd($buildbugCmd, "--pkg-version=$pkgVersion") if defined $pkgVersion;
+	    $buildbugCmd = AppendToBashCmd($buildbugCmd, ["--pkg-version=$pkgVersion"]) if defined $pkgVersion;
 	}
 	my $configureStdout = BuildFile('configure_stdout.out');
 	my $configureStderr = BuildFile('configure_stderr.out');
