@@ -26,7 +26,7 @@ use Cwd;
 use Time::HiRes qw( gettimeofday );
 use Data::Dumper;
 
-my $buildBugVersion = '1.1.19 (Jun 25, 2018)';
+my $buildBugVersion = '1.1.20 (Sep 14, 2018)';
 my $fwName = 'c-assess';
 my $fwVersion = $buildBugVersion;
 $fwVersion =~ s/ .*$//;
@@ -273,7 +273,7 @@ sub ParseArg
 	}
     }
 
-    if ($s =~ s/^\s*"(.*?(?<!\\))"//)  {
+    if ($s =~ s/^\s*"((?:[^\\]|\\.)*?)"//)  {
 	$argValue = UnescapeCString($1);
 	if ($s =~ s/^\.{3}//)  {
 	    $argType = 'string-incomplete';
@@ -2037,7 +2037,10 @@ sub GetGccInfo
 	    if (/^Target:\s+(.*?)\s*$/)  {
 		$o{target} = $1;
 	    }  elsif (/^gcc version\s+(.*?)\s*$/)  {
-		$o{version} = $1;
+		my $versionText = $1;
+		$o{'#versionText'} = $versionText;
+		$versionText =~ s/\s.*$//;
+		$o{version} = $versionText;
 	    }  elsif (/^#include "..." search starts here:/)  {
 		$searchPathType = 'includeSearch';
 	    }  elsif (/^#include <...> search starts here:/)  {
@@ -2281,6 +2284,8 @@ sub GetCmdInfo
 	}  elsif ($type eq 'as')  {
 	    $data->{cmdInfo}{$path} = GetAsInfo($path);
 	}
+
+	$data->{cmdInfo}{$path}{cmdType} = $type;
     }
 }
 
@@ -3121,6 +3126,53 @@ sub ReadConfFile
     }
 
     return \%h;
+}
+
+
+sub WriteConfFile
+{
+    my ($filename, $data, $type) = @_;
+
+    my $ws = ' ';
+    if (defined $type)  {
+	if ($type eq 'simple')  {
+	    $ws = '';
+	}  else  {
+	    die "WriteConfFile: unknown type '$type'"
+	}
+    }
+
+    open CONFFILE, ">", $filename or die "open > $filename: $!";
+    foreach my $k (sort keys %$data)  {
+	my $v = $data->{$k};
+	die "WriteConfFile: leading whitespace in key: filename='$filename' k='$k' v='$v'" if $k =~ /^\s/;
+	die "WriteConfFile: trailing whitespace in key: filename='$filename' k='$k' v='$v'" if $k =~ /\s$/;
+	die "'=' in key: filename='$filename' k='$k' v='$v'" if $k =~ /=/;
+
+	my $numLines = ($v =~ tr/\n//) + 1;
+	my $sep;
+
+	if (defined $type)  {
+	    if ($type eq 'simple')  {
+		if ($numLines != 1)  {
+		    die "WriteConfFile: type is '$type' and '$k' contains multiple lines";
+		}  else  {
+		    $sep = '=';
+		}
+	    }
+	}  else  {
+	    if ($numLines != 1)  {
+		$sep = ":${numLines}L=";
+	    }  elsif ($v =~ /^\s+|\s+$/)  {
+		$sep = ":=";
+	    }  else  {
+		$sep = "=$ws";
+	    }
+	}
+
+	print CONFFILE "$k$ws$sep$v\n";
+    }
+    close CONFFILE or die "close $filename";
 }
 
 
@@ -4901,6 +4953,8 @@ EOF
     }
 
     my ($prevDir, $prevEnv) = ('', \%ENV);
+    my %compilerData;
+    my $cmdInfo = $data->{cmdInfo};
     foreach my $eid (@{$data->{buildEids}})  {
 	my $e = $eids->{$eid};
 	my $buildExecType = $e->{buildInfo}{buildExecType};
@@ -4937,11 +4991,35 @@ EOF
 		$errorMsg = "# Files not found ($missingFiles), skipping:\n" ;
 	    }
 	    if ($errorMsg eq '')  {
-		($prevDir, $prevEnv) = ($newDir, $newEnv)
+		($prevDir, $prevEnv) = ($newDir, $newEnv);
+
+		my $cmdPath = $e->{cmdPath};
+		my $files = $e->{buildInfo}{files};
+		my $fileTypes = $e->{buildInfo}{fileTypes};
+		my $cFiles = (grep {$fileTypes->{$_} eq 'c'} @$files);
+		my $cppFiles = (grep {$fileTypes->{$_} eq 'c++'} @$files);
+		if ($cFiles || $cppFiles)  {
+		    my $dialect = $e->{buildInfo}{dialect};
+		    my $version = $cmdInfo->{$cmdPath}{version};
+		    my $bits = $cmdInfo->{$cmdPath}{bits};
+		    my $cDialect = '';
+		    my $cppDialect = '';
+		    foreach my $d (@$dialect)  {
+			$cDialect = $d if $d =~ /^-std=(c|gnu)[^+]/;
+			$cppDialect = $d if $d =~ /^-std=(c|gnu)\+\+/;
+		    }
+		    $compilerData{$cmdPath}{version} = $version;
+		    $compilerData{$cmdPath}{bits} = $bits;
+		    $compilerData{$cmdPath}{type} = $buildExecType;
+		    $compilerData{$cmdPath}{lang}{c}{$cDialect} += $cFiles if $cFiles;
+		    $compilerData{$cmdPath}{lang}{cpp}{$cppDialect} += $cppFiles if $cppFiles;
+		    $compilerData{$cmdPath}{dialect} = $dialect;
+		    $compilerData{$cmdPath}{cmdInfo} = $cmdInfo;
+		}
 	    }  else  {
 		$s =~ s/^/#  /mg;
 	    }
-	    print BUILDFILE "\n# eid=$eid\n$errorMsg$s"
+	    print BUILDFILE "\n# eid=$eid\n$errorMsg$s";
 	}
     }
 
@@ -4949,7 +5027,7 @@ EOF
 
     chmod 0755, $filename or die "chmod 0755, $filename";
 
-    return;
+    return \%compilerData;
 }
 
 
@@ -5534,7 +5612,7 @@ sub DoSynopsysCoverityAssessment
 
     if (defined $toolConf->{'tool-license-file'} && -f $toolConf->{'tool-license-file'})  {
 	use File::Copy;
-	my $license = "/mnt/in/" . $toolConf->{'tool-license-file'};
+	my $license = GetMntIn() . $toolConf->{'tool-license-file'};
 	my $to = "$toolDir/" . $toolConf->{'tool-license-dat-file'};
 	copy $license, $to or die "cp $license, $to: $!";
     }  else  {
@@ -5665,14 +5743,448 @@ sub DoSynopsysCoverityAssessment
 ############################# Programming Research PRQA Framekwork #############################
 
 
+sub WriteScarfAttrsFile
+{
+    my ($filename, $data, $toolConf, $uuid, $startTs, $reportPath, $weaknessCountPath) = @_;
+
+    my $toolVersion;
+    if (defined $toolConf->{'tool-version'})  {
+	$toolVersion = $toolConf->{'tool-version'};
+    }  elsif (defined $toolConf->{'#toolVersionText'})  {
+	$toolVersion = $toolConf->{'#toolVersionText'};
+    }
+
+    my %confData = (
+	assess_fw		=> $data->{assessFw},
+	assess_fw_version	=> $data->{assessFwVersion},
+	assessment_start_ts	=> $startTs,
+	build_fw		=> $data->{buildFw},
+	build_fw_version	=> $data->{buildFwVersion},
+	build_root_dir		=> $data->{buildRootDir},
+	package_name		=> $data->{pkgName},
+	package_root_dir	=> $data->{packageRootDir},
+	package_version		=> $data->{pkgVersion},
+	platform_name		=> $data->{platName},
+	uuid			=> $uuid,
+	report_output_file	=> $reportPath,
+	weakness_count_file	=> $weaknessCountPath,
+    );
+
+    WriteConfFile($filename, \%confData, 'simple');
+}
+
+
+sub CompareVersions
+{
+    my ($v1, $v2) = @_;
+
+    my @a1 = split /\./, $v1;
+    my @a2 = split /\./, $v2;
+
+    while (@a1 || @a2)  {
+	my $x1 = shift @a1;
+	my $x2 = shift @a2;
+
+	$x1 = 0 unless defined $x1;
+	$x2 = 0 unless defined $x2;
+
+	my $c = $x1 <=> $x2;
+
+	return $c unless $c == 0;
+    }
+
+    return 0;
+}
+
+
+sub GetVersionList
+{
+    my ($v) = @_;
+
+    my @a = ( $v );
+
+    while ($v =~ s/^(.*)\..*/$1/)  {
+	push @a, $v;
+    }
+
+    return \@a;
+}
+
+
+sub GetDialectList
+{
+    my ($std, $type, $version) = @_;
+
+    my @a = ( $std );
+
+    if ($std eq '' && $type eq 'gcc' && CompareVersions($version, "5.0") >= 0)  {
+	$std = 'gnu11';
+	push @a, $std;
+    }
+
+    if ($std eq '' && $type eq 'g++' && CompareVersions($version, "6.0") >= 0)  {
+	$std = 'gnu++14';
+	push @a, $std;
+    }
+
+    if ($std =~ s/^gnu/c/)  {
+	push @a, $std;
+    }
+
+    return \@a;
+}
+
+
+sub GetBuiltInPrqaCcts
+{
+    my ($data, $compilerData, $cctDir) = @_;
+
+    opendir DIR, $cctDir or die "opendir $cctDir: $!";
+    my @validCcts = readdir DIR;
+    closedir DIR or die "closedir $cctDir: $!";
+
+    my %ccts;
+
+    my %canonicalStdName = (
+	c90			=> 'c90',
+	c89			=> 'c90',
+	'iso9899:1990'		=> 'c90',
+	'iso9899:199409'	=> 'c95',
+	c99			=> 'c99',
+	c9x			=> 'c99',
+	'iso9899:1999'		=> 'c99',
+	'iso9899:199x'		=> 'c99',
+	c11			=> 'c11',
+	c1x			=> 'c11',
+	'iso9899:2011'		=> 'c11',
+	'c17'			=> 'c17',
+	'c18'			=> 'c17',
+	'iso9899:2017'		=> 'c17',
+	'iso9899:2018'		=> 'c17',
+	'gnu90'			=> 'gnu89',
+	'gnu89'			=> 'gnu89',
+	'gnu99'			=> 'gnu99',
+	'gnu9x'			=> 'gnu99',
+	'gnu11'			=> 'gnu11',
+	'gnu1x'			=> 'gnu11',
+	'gnu17'			=> 'gnu17',
+	'gnu18'			=> 'gnu17',
+	'c++98'			=> 'c++98',
+	'c++03'			=> 'c++03',
+	'gnu++98'		=> 'gnu++98',
+	'gnu++03'		=> 'gnu++03',
+	'c++11'			=> 'c++11',
+	'c++0x'			=> 'c++11',
+	'gnu++11'		=> 'gnu++11',
+	'gnu++0x'		=> 'gnu++11',
+	'c++14'			=> 'c++14',
+	'c++1y'			=> 'c++14',
+	'gnu++14'		=> 'gnu++14',
+	'gnu++1y'		=> 'gnu++14',
+	'c++17'			=> 'c++17',
+	'c++1z'			=> 'c++17',
+	'gnu++17'		=> 'gnu++17',
+	'gnu++1z'		=> 'gnu++17',
+	'c++2a'			=> 'c++2a',
+	'gnu++2a'		=> 'gnu++2a',
+    );
+
+    my $plat = 'generic-linux';
+    foreach my $path (keys %$compilerData)  {
+	my $compiler = $compilerData->{$path};
+	my $bits = $compiler->{bits};
+	my $arch = ($bits == 64) ? "x86_64" : "i686";
+	my $version = $compiler->{version};
+	my $versions = GetVersionList($version);
+	my $type = $compiler->{type};
+	foreach my $lang (keys %{$compiler->{lang}})  {
+	    my $langStdCounts = $compiler->{lang}{$lang};
+	    my $langName; 
+	    if ($lang eq 'c')  {
+		$langName = 'C';
+	    }  elsif ($lang eq 'cpp')  {
+		$langName = 'C++';
+	    }  else  {
+		die "compiler language ($lang) not 'c' or 'cpp'"
+	    }
+	    foreach my $std (keys %$langStdCounts)  {
+		next unless $langStdCounts->{$std} > 0;
+		my $stdName;
+		if ($std ne '')  {
+		    $std = $canonicalStdName{$std};
+		    die "unknown language standard ($std)" unless defined $std;
+		}
+		my $dialects = GetDialectList($std, $type, $version);
+		my @foundCcts;
+		VERSION: foreach my $v (@$versions)  {
+		    foreach my $stdName (@$dialects)  {
+			my $dialect = $langName;
+			$dialect .= "-$stdName" if $stdName ne '';
+			my $re = qr/^(?:GNU[-_])?GCC[-_]\Q${type}\E[-_]$v-$arch-$plat-\Q$dialect\E\.cct/;
+			@foundCcts = grep /$re/, @validCcts;
+			last VERSION if @foundCcts;
+		    }
+		}
+		if (@foundCcts)  {
+		    foreach my $cct (@foundCcts)  {
+			$ccts{$lang}{$cct} = 1;
+		    }
+		}  else  {
+		    die "No cct found in $cctDir for version=$version type=$type dialect=$std plat=$plat arch=$arch";
+		}
+	    }
+	}
+    }
+
+    my @a;
+    foreach my $lang (keys %ccts)  {
+	my @ccts = keys %{$ccts{$lang}};
+	if (@ccts <= 1)  {
+	    push @a, @ccts;
+	}  else  {
+	    die "Found multiple ccts for $lang: @ccts";
+	}
+    }
+
+    return \@a;
+}
+
+
+sub GeneratePrqaCcts
+{
+    my ($data, $compilerData, $cctGenScript) = @_;
+
+    my $resultsDir = $data->{resultsDir};
+    my $cctDir = "$resultsDir/ccts";
+
+    if (!-d $cctDir)  {
+	mkdir $cctDir, 0755 or die "mkdir $cctDir, 0755:  $!";
+    }
+
+    my @ccts;
+    my $n = 0;
+
+    foreach my $path (keys %$compilerData)  {
+	my $compiler = $compilerData->{$path};
+
+	my @cmd = ("python", $cctGenScript,
+		    "--overwrite",
+		    "-op", $cctDir,
+		    "-c", $path);
+
+	my $dialect = $compiler->{dialect};
+	push @cmd, @$dialect if defined $dialect;
+	
+	++$n;
+
+	my $stdout = "$resultsDir/cct_gen_${n}_out.out";
+	my $stderr = "$resultsDir/cct_gen_${n}_err.out";
+
+	my $cmd = GetCmdString(\@cmd);
+	print "$cmd\n\n";
+	ExecCmdAndFail($cmd, undef, undef, $stdout, $stderr);
+
+	my $contents = ReadFile($stdout);
+	chomp $contents;
+	if ($contents =~ /^Writing\s+(.*?)\s*$/)  {
+	    push @ccts, $1;
+	}  else  {
+	    die "Bad Format for cct generator ($cctGenScript) stdout ($stdout), should be 'Writing <CCT_FILE_PATH>', is '$contents'";
+	}
+    }
+
+    return \@ccts;
+}
+
+
+sub GetPrqaCcts
+{
+    my ($data, $compilerData, $cctDir, $cctGenScript) = @_;
+
+    my $ccts;
+
+    if (defined $cctGenScript)  {
+	$ccts = GeneratePrqaCcts($data, $compilerData, $cctGenScript)
+    }  else  {
+	$ccts = GetBuiltInPrqaCcts($data, $compilerData, $cctDir)
+    }
+
+    return $ccts;
+}
+
+
+sub ValidatePrqaLicenseFeatures
+{
+    my ($licenseOut, $toolConf) = @_;
+
+    my @features = split ' ', $toolConf->{'tool-prqa-framework-required-features'};
+    my %features = map {$_ => 1} @features;
+
+    open F, "<", $licenseOut or die "open <$licenseOut:  $!";
+    while (<F>)  {
+	if (/^\s*([^-]*)-([.0-9]*)\s*-\s*((?:Not\s+)?Available)\s*/)  {
+	    my ($f, $v, $a) = ($1, $2, $3);
+
+	    if ($a eq 'Available')  {
+		delete $features{$f};
+	    }
+	}
+    }
+    close F or die "close $licenseOut:  $!";
+
+    my @missing = keys %features;
+
+    return \@missing;
+}
+
+
 sub DoPrqaFrameworkAssessment
 {
-    die "Not implemented";
+    my ($data, $toolType, $resultsDir, $toolPath, $toolOpt, $toolConfFile, $toolDir,
+	    $servicesConfFile, $toolsBaseDir) = @_;
+
+    my ($pass, $fail, $skip) = (0, 0);
+    my $uuid = GetUuid();
+    my $assessStartTs = GetCurTs();
+    my $savedCwd = getcwd();
+    my $buildRootDir = $data->{buildRootDir};
+    my $id = 0;
+
+    my @toolRequiredOpts = qw(	tool-prqa-framework-cct-dir
+				tool-prqa-framework-rcf
+				tool-prqa-framework-acf
+				tool-prqa-framework-project_dirname
+				tool-prqa-framework-required-features );
+    my $toolConf = ReadConfFile($toolConfFile, \@toolRequiredOpts);
+    my $toolVersion = $toolConf->{'tool-version'};
+
+    my $mntInDir = GetMntInDir();
+    my $homeDir = GetHomeDir();
+
+    my $rcf = "$mntInDir/" . $toolConf->{'tool-prqa-framework-rcf'};
+    my $acf = $toolConf->{'tool-prqa-framework-acf'};
+    my $project = "$resultsDir/" . $toolConf->{'tool-prqa-framework-project_dirname'};
+    my $cctDir = "$homeDir/" . $toolConf->{'tool-prqa-framework-cct-dir'};
+    my $cctGenScript = $toolConf->{'tool-prqa-framework-gcc-cct-generator-script'};
+    $cctGenScript = "$toolsBaseDir/$cctGenScript" if defined $cctGenScript;
+    my $requiredFeatures = $toolConf->{'tool-prqa-framework-required-features'};
+
+    die "--servicesconf option required, but option missing" unless defined $servicesConfFile;
+    my @servicesRequiredOpts = qw( tool-prqa-framework-license-host tool-prqa-framework-license-port );
+    my $servicesConf = ReadConfFile($servicesConfFile, \@servicesRequiredOpts);
+    my $licenseHost = $servicesConf->{'tool-prqa-framework-license-host'};
+    my $licensePort = $servicesConf->{'tool-prqa-framework-license-port'};
+    my $licenseHostPort = "$licensePort\@$licenseHost";
+
+    # initialize license
+    my @cmd = ( $toolPath, 'admin', '--set-license-server', $licenseHostPort );
+    my $cmd = GetCmdString(\@cmd);
+    print STDERR "$cmd\n\n";
+    my $licenseStdoutPath = "$resultsDir/set_license_server_out.out";
+    my $licenseStderrPath = "$resultsDir/set_license_server_err.out";
+    ExecCmdAndFail($cmd, undef, undef, $licenseStdoutPath, $licenseStderrPath);
+
+    # validate license features
+    my $missingFeatures
+	    = ValidatePrqaLicenseFeatures($licenseStdoutPath, $toolConf);
+    if (@$missingFeatures)  {
+	my $msg = "Required license features not enabled in '$licenseStdoutPath'";
+	$msg .= ":  " . join(' ', @$missingFeatures) . "\n";
+	$@ = LogStatus('assess-acquire-license', '', 1, undef, $msg);
+	die $@;
+    }
+
+    # run assessment
+    my $asFile = "$resultsDir/assessment_summary.xml";
+    open my $asFH, ">", $asFile or die "open $asFile: $!";
+
+    my $indent = 0;
+    my $indent2;
+    $indent2 = $indent + 2 if defined $indent;
+
+    PrintAssessmentSummaryHeaderXml($asFH, $indent, $data, $toolConf, $uuid);
+
+    chdir $buildRootDir or die "chdir $buildRootDir";
+
+    ++$id;
+    my $stdoutFileName = "stdout$id.out";
+    my $stderrFileName = "stderr$id.out";
+    my $stdoutPath = "$resultsDir/$stdoutFileName";
+    my $stderrPath = "$resultsDir/$stderrFileName";
+    my $assessCmdsFile = "$resultsDir/assessCmds$id.sh";
+
+    my $resultsFile = "$resultsDir/results.xml";
+    my $weaknessCountFile = "$resultsDir/weaknesses.txt";
+    my $scarfAttrsFile = "$resultsDir/scarf_attrs.conf";
+    WriteScarfAttrsFile($scarfAttrsFile, $data, $toolConf, $uuid, $assessStartTs,
+	    $resultsFile, $weaknessCountFile);
+
+    my $compilerData = WriteCsonarBuildFile($data, $assessCmdsFile);
+    my $ccts = GetPrqaCcts($data, $compilerData, $cctDir, $cctGenScript);
+
+    @cmd = ( $toolPath, 'admin',
+		'-P', $project,
+		'--qaf-project-config',
+		'-A', $acf,
+		'-R', $rcf );
+    foreach my $cct (@$ccts)  {
+	push @cmd, '-C', $cct;
+    }
+
+    $cmd = GetCmdString(\@cmd);
+    print "$cmd\n\n";
+    my $projectConfigStdoutPath = "$resultsDir/project_config_out.out";
+    my $projectConfigStderrPath = "$resultsDir/project_config_err.out";
+    ExecCmdAndFail($cmd, undef, undef, $projectConfigStdoutPath, $projectConfigStderrPath);
+
+    @cmd = ( $toolPath, 'analyze', '-P', $project, '-b', $assessCmdsFile );
+    $cmd = GetCmdString(\@cmd);
+    print "$cmd\n\n";
+    my $analyzeStdoutPath = "$resultsDir/analyze_out.out";
+    my $analyzeStderrPath = "$resultsDir/analyze_err.out";
+    ExecCmdAndFail($cmd, undef, undef, $analyzeStdoutPath, $analyzeStderrPath);
+
+    my $startTs = GetCurTs();
+    @cmd = ( $toolPath, 'report', '-P', $project, '-t', 'SCARF' );
+    $cmd = GetCmdString(\@cmd);
+    print "$cmd\n\n";
+    my $reportStdoutPath = "$resultsDir/report_out.out";
+    my $reportStderrPath = "$resultsDir/report_err.out";
+    my ($exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus)
+	    = ExecCmd($cmd, undef, undef, $reportStdoutPath, $reportStderrPath);
+
+    my $stopTs = GetCurTs();
+    if ($exitStatus == 0)  {
+	++$pass;
+    }  else  {
+	++$fail;
+	print STDERR "# Error: ", GetExecErrorMsg(\@cmd, $exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus), "\n";
+    }
+
+    print $asFH XmlAssessment($cmd[0], \@cmd, \%ENV, $buildRootDir,
+				$resultsFile, $stdoutFileName, $stderrFileName, $id,
+				$exitCode, $exitSignalName, $startTs, $stopTs, $indent2);
+
+    my $assessStopTs = GetCurTs();
+
+    chdir $savedCwd;
+
+    PrintAssessmentSummaryFooterXml($asFH, $indent, $assessStartTs, $assessStopTs);
+
+    close $asFH or die "close $asFile: $!";
+
+    return ($pass, $fail, $skip);
 }
 
 
 
 ############################# RedLizard Goanna #############################
+
+
+sub GetMntInDir
+{
+    return "/mnt/in";
+}
 
 
 sub GetHomeDir
@@ -5959,6 +6471,9 @@ sub DoBuildAndProcess
 		initialCwd	=> $initialCwd,
 		packageRootDir	=> $options{packagerootdir},
 		buildRootDir	=> $options{buildrootdir},
+		resultsDir	=> $options{resultsdir},
+		toolsBaseDir	=> $options{toolsbasedir},
+		toolDir		=> $options{tooldir},
 		platName	=> $options{'plat-name'},
 		platUuid	=> $options{'plat-uuid'},
 		pkgName		=> $options{'pkg-name'},
