@@ -1,4 +1,10 @@
 -------------------------------------
+C-assess  version 1.1.21 (Sep 21, 2018)
+-------------------------------------
+- fix quoted escapable regular expression so that it does not exceed
+  backtracking space limit for large strings by using possessive quantifiers
+
+-------------------------------------
 C-assess  version 1.1.20 (Sep 14, 2018)
 -------------------------------------
 - add preliminary support for PRQA
