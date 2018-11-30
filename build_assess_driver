@@ -26,7 +26,7 @@ use Getopt::Long;
 use Time::HiRes qw( gettimeofday );
 
 
-my $buildAssessDriverVersion = '1.1.21 (Sep 24, 2018)';
+my $buildAssessDriverVersion = '1.1.22 (Nov 29, 2018)';
 my %options;
 my $statusFile;
 
@@ -1553,6 +1553,7 @@ sub DoBuild
 		push @cmd, "--package-root-dir=$pkgDir" if defined $pkgDir;
 		push @cmd, "--build-root-dir=$buildRootDir" if defined $buildRootDir;
 		push @cmd, "--msg=$shortMsgPath" if defined $shortMsgPath;
+		DoChdir($dir, 'build-dir') if defined $dir;
 		eval {PrintAndExecCmdAndFail(\@cmd)};
 		my $savedErrs = $@;
 

@@ -1,4 +1,9 @@
 -------------------------------------
+C-assess  version 1.1.21 (Nov 29, 2018)
+-------------------------------------
+- no-build: chdir to build-dir if present
+
+-------------------------------------
 C-assess  version 1.1.21 (Sep 21, 2018)
 -------------------------------------
 - fix quoted escapable regular expression so that it does not exceed
