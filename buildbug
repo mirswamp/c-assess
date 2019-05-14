@@ -3,7 +3,7 @@
 #
 #  buildbug   http://www.cs.wisc.edu/~kupsch
 # 
-#  Copyright 2013-2018 James A. Kupsch
+#  Copyright 2013-2019 James A. Kupsch
 # 
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@ use Cwd;
 use Time::HiRes qw( gettimeofday );
 use Data::Dumper;
 
-my $buildBugVersion = '1.1.22 (Nov 29, 2018)';
+my $buildBugVersion = '1.1.23 (May 14, 2019)';
 my $fwName = 'c-assess';
 my $fwVersion = $buildBugVersion;
 $fwVersion =~ s/ .*$//;
