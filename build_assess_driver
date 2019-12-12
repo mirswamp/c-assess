@@ -26,9 +26,12 @@ use Getopt::Long;
 use Time::HiRes qw( gettimeofday );
 
 
-my $buildAssessDriverVersion = '1.1.25 (Nov 19, 2019)';
+my $buildAssessDriverVersion = '1.2.0 (Dec 11, 2019)';
 my %options;
 my $statusFile;
+
+my %statusNumToStatus = (0 => 'PASS', 1 => 'FAIL', -1 => 'SKIP', -2 => 'NOTE');
+my %statusToStatusNum = reverse %statusNumToStatus;
 
 my $homeDir = getcwd();
 my $buildBaseDir = "$homeDir/build";
@@ -67,7 +70,7 @@ sub PrintVersion
 {
     my $progname = $0;
     $progname =~ s/.*(\\\/)//;
-    print "$progname version $buildAssessDriverVersion\n";
+    print "$progname (c-assess) version $buildAssessDriverVersion\n";
 }
 
 
@@ -247,9 +250,8 @@ sub LogStatus
     my $div = "----------\n";
     my $prefix = '  ';
     $state = 0 unless $state;
-    my %stateToMsg = (0 => 'PASS', 1 => 'FAIL', -1 => 'SKIP', -2 => 'NOTE');
-    die "LogStatus: unknown state ($state)" unless defined $stateToMsg{$state};
-    my $stateMsg = $stateToMsg{$state};
+    die "LogStatus: unknown state ($state)" unless defined $statusNumToStatus{$state};
+    my $stateMsg = $statusNumToStatus{$state};
     $dur = '' unless defined $dur;
     $dur = MakeTs($dur) . 's' unless $dur eq '';
     $task .= " ($shortMsg)" if HasValue $shortMsg;
@@ -302,10 +304,9 @@ sub ReadTaskInfoFile
 	    # next line is the state (PASS, FAIL, SKIP or NOTE),
 	    # or the long message divider and state is PASS
 	    if ($line !~ /^-+$/)  {
-		my %stateToValue = (PASS => 0, FAIL => 1, SKIP => -1, NOTE => -2);
 		die "Unknown state '$line' in ReadTaskInfoFile($filename)"
-			unless exists $stateToValue{$line};
-		$state = $stateToValue{$line};
+			unless exists $statusToStatusNum{$line};
+		$state = $statusToStatusNum{$line};
 		$line = <FILE>;
 	    }  else  {
 		$state = 0;
@@ -697,6 +698,7 @@ sub WriteConfFile
     open CONFFILE, ">", $filename or die "open > $filename: $!";
     foreach my $k (sort keys %$confKeys)  {
 	my $v = $confKeys->{$k};
+	next unless defined $v;
 	die "leading whitespace in key: filename='$filename' k='$k' v='$v'" if $k =~ /^\s/;
 	die "trailing whitespace in key: filename='$filename' k='$k' v='$v'" if $k =~ /\s$/;
 	die "'=' in key: filename='$filename' k='$k' v='$v'" if $k =~ /=/;
@@ -1256,7 +1258,8 @@ sub ArchiveExtract
 
 sub ArchiveCreate
 {
-    my ($archiveDir, $confKeyPrefix, $xmlFileKeyPrefix, $xmlFile, $extraConf) = @_;
+    my ($archiveDir, $confKeyPrefix, $xmlFileKeyPrefix, $xmlFile, $conf) = @_;
+    $conf = {} unless defined $conf;
     my $tarFileName = "${archiveDir}.tar.gz";
     my $tarPath = OutFile($tarFileName);
     my $savedErrs = '';
@@ -1270,13 +1273,10 @@ sub ArchiveCreate
 
 	my $confFile = "${archiveDir}.conf";
 	my $confPath = OutFile($confFile);
-	my $contents = <<EOF;
-${confKeyPrefix}-dir=$archiveDir
-${confKeyPrefix}-archive=$tarFileName
-${xmlFileKeyPrefix}-file=$xmlFile
-EOF
-	$contents .= "\n$extraConf" if defined $extraConf;
-	CreateFileWithContents($confPath, $contents);
+	$conf->{"${confKeyPrefix}-archive"} = $tarFileName;
+	$conf->{"${confKeyPrefix}-dir"} = $archiveDir;
+	$conf->{"${xmlFileKeyPrefix}-file"} = $xmlFile unless exists $conf->{"${xmlFileKeyPrefix}-file"};
+	WriteConfFile($confPath, $conf);
     }  else  {
 	$savedErrs .= LogStatus("${archiveDir}-archive", '', -1, undef, '');
     }
@@ -1601,9 +1601,10 @@ sub DoBuild
     eval {
 	DoChdir($homeDir);
 
-	my $extraConf .= "no-build-failures=$sourceCompilesFile\n" if defined $sourceCompilesFile;
+	my %extraConf;
+	$extraConf{'no-build-failures'} = $sourceCompilesFile if defined $sourceCompilesFile;
 	ArchiveCreate('build', 'build', 'build-summary',
-			'build_summary.xml', $extraConf);
+			'build_summary.xml', \%extraConf);
     };
     $savedErrs = AppendException($savedErrs, $@);
 
@@ -1639,6 +1640,7 @@ sub DoParseResults
     my ($resultsDir, $assessmentSummaryFile) = @_;
 
     my $resultParserConfFile = InFile('resultparser.conf');
+    my $servicesConfFile = InFile('services.conf');
     my $resultParserData = ReadConfFile($resultParserConfFile);
     my $resultParserDir = ConcatPaths($resultParserBaseDir, $resultParserData->{'result-parser-dir'});
     my $resultParserCmd = ConcatPaths($resultParserDir, $resultParserData->{'result-parser-cmd'});
@@ -1654,16 +1656,23 @@ sub DoParseResults
 
     my $outputFile = ConcatPaths($parsedResultsBaseDir, 'parsed_results.xml');
     my $weaknessCountFile = ConcatPaths($parsedResultsBaseDir, 'weaknesses.txt');
+    my $parsedResultsDataFile = ConcatPaths($parsedResultsBaseDir, 'parsed_results_data.conf');
+    my $resultParserStdoutFilename = 'resultparser_stdout.out';
+    my $resultParserStderrFilename = 'resultparser_stderr.out';
+    my $resultParserStdout = ConcatPaths($parsedResultsBaseDir, $resultParserStdoutFilename);
+    my $resultParserStderr = ConcatPaths($parsedResultsBaseDir, $resultParserStderrFilename);
 
     my @cmd = ($resultParserCmd,
 		    '--summary_file', $assessmentSummaryFile,
 		    '--output_file', $outputFile,
-		    '--weakness_count_file', $weaknessCountFile
+		    '--weakness_count_file', $weaknessCountFile,
+		    '--parsed_results_data_conf_file', $parsedResultsDataFile,
 		    );
+    push @cmd, '--services_conf_file', $servicesConfFile if -f $servicesConfFile;
 
     my ($startTs, $stopTs, $dur);
     $startTs = GetCurTs();
-    eval {PrintAndExecCmdAndFail(\@cmd)};
+    eval {PrintAndExecCmdAndFail(\@cmd, undef, undef, $resultParserStdout, $resultParserStderr)};
     $stopTs = GetCurTs();
     $dur = DiffTs($startTs, $stopTs);
 
@@ -1680,6 +1689,18 @@ sub DoParseResults
     }
     $state = $@ ne '' unless defined $state;
 
+    my $parsedResultsData;
+    if (-f $parsedResultsDataFile)  {
+	$parsedResultsData = ReadConfFile($parsedResultsDataFile);
+	$parsedResultsData->{'resultparser-stdout-file'} = $resultParserStdoutFilename;
+	$parsedResultsData->{'resultparser-stderr-file'} = $resultParserStderrFilename;
+    }  elsif (!$state)  {
+	$state = 1;
+	$shortMsg = '';
+	$longMsg = "parsed_results_data.conf file not found at $parsedResultsDataFile";
+    }
+
+
     $@ = LogStatus('parse-results', $shortMsg, $state, $dur, $longMsg);
     my $savedErrs = $@;
 
@@ -1687,7 +1708,7 @@ sub DoParseResults
 	DoChdir($homeDir);
 
 	ArchiveCreate('parsed_results', 'parsed-results', 'parsed-results',
-			'parsed_results.xml', undef);
+			'parsed_results.xml', $parsedResultsData);
     };
     $savedErrs = AppendException($savedErrs, $@);
 

@@ -26,7 +26,7 @@ use Cwd;
 use Time::HiRes qw( gettimeofday );
 use Data::Dumper;
 
-my $buildBugVersion = '1.1.25 (Nov 19, 2019)';
+my $buildBugVersion = '1.2.0 (Dec 11, 2019)';
 my $fwName = 'c-assess';
 my $fwVersion = $buildBugVersion;
 $fwVersion =~ s/ .*$//;
@@ -2862,7 +2862,7 @@ sub XmlExec
     $s .= XmlElem('peid', $e->{peid}, $eIndent);
     $s .= XmlElem('start-ts', $e->{startTs}, $eIndent);
     $s .= XmlElem('stop-ts', $e->{stopTs}, $eIndent);
-    $s .= XmlElem('exit-status', $e->{exitStatus}, $eIndent);
+    $s .= XmlElem('exit-code', $e->{exitStatus}, $eIndent);
     $s .= XmlElem('exit-signal', $e->{exitSignal}, $eIndent);
     $s .= XmlElem('exit-signal-msg', $e->{exitSignalMsg}, $eIndent);
     $s .= XmlExecAttrs($e->{cmdPath}, $e->{startArgs}, $e->{startEnv}, $e->{startCwd}, $eIndent);
@@ -2952,11 +2952,12 @@ sub XmlCommand
 sub XmlAssessment
 {
     my ($executable, $args, $env, $cwd, $report, $stdout, $stderr, $reportId,
-	    $exitCode, $exitSignal, $startTs, $stopTs, $indent) = @_;
+	    $exitCode, $exitSignal, $startTs, $stopTs, $indent, $executionSuccessful) = @_;
 
     my $s = '';
     my $eIndent = $indent;
     ++$eIndent if defined $eIndent;
+    $executionSuccessful = ($exitCode == 0 && !defined $exitSignal);
 
     $s .= XmlOpenTag('assessment', $indent);
     $s .= XmlElem('report', $report, $eIndent);
@@ -2965,6 +2966,7 @@ sub XmlAssessment
     $s .= XmlElem('build-artifact-id', $reportId, $eIndent);
     $s .= XmlElem('exit-code', $exitCode, $eIndent);
     $s .= XmlElem('exit-signal', $exitSignal, $eIndent);
+    $s .= XmlElem('execution-successful', BoolToString($executionSuccessful), $eIndent);
     $s .= XmlElem('start-ts', $startTs, $eIndent);
     $s .= XmlElem('stop-ts', $stopTs, $eIndent);
     $s .= XmlCommand($executable, $args, $env, $cwd, $eIndent);
@@ -2991,6 +2993,14 @@ sub BoolValue
     return 0 if !HasValue($b) || $b =~ /^(0|false|no)$/i;
     return 1 if $b =~ /^(1|true|yes)$/i;
     return undef;
+}
+
+
+sub BoolToString
+{
+    my ($b) = @_;
+
+    return $b ? 'true' : 'false';
 }
 
 

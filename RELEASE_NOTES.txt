@@ -1,9 +1,18 @@
 -------------------------------------
+C-assess  version 1.2.0 (Dec 11, 2019)
+-------------------------------------
+- pass --services_conf_file to resultparser
+- pass --parsed_results_data_conf_file to resultsparser
+- read parsed_results_data.conf file and incorporate in parsed_results.conf
+- add execution-successul element to assesment_summary.xml assessment commands 
+- put resultparser stdout and stderr in their own files in the parsed_results
+  directory
+
+-------------------------------------
 C-assess  version 1.1.26 (Nov 25, 2019)
 -------------------------------------
-- updated low-level code to support running in a docker container
-- improved the reliability and operational reporting of the low-level
-  code that provisions the VM (or container) to run the framework
+- improved low-level provisioning code's logging, reliability and
+  support for running in both VMs and Docker containers.
 
 -------------------------------------
 C-assess  version 1.1.25 (Nov 19, 2019)
