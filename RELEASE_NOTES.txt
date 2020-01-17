@@ -1,4 +1,10 @@
 -------------------------------------
+C-assess  version 1.2.1 (Jan 16, 2020)
+-------------------------------------
+- Improved low-level provisioning code to include additional diagnostic
+  information, and other small improvements
+
+-------------------------------------
 C-assess  version 1.2.0 (Dec 11, 2019)
 -------------------------------------
 - pass --services_conf_file to resultparser

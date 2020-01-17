@@ -3,7 +3,7 @@
 #
 #  build_assess_driver   http://www.cs.wisc.edu/~kupsch
 # 
-#  Copyright 2013-2019 James A. Kupsch
+#  Copyright 2013-2020 James A. Kupsch
 # 
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@ use Getopt::Long;
 use Time::HiRes qw( gettimeofday );
 
 
-my $buildAssessDriverVersion = '1.2.0 (Dec 11, 2019)';
+my $buildAssessDriverVersion = '1.2.1 (Jan 16, 2020)';
 my %options;
 my $statusFile;
 
@@ -1694,6 +1694,9 @@ sub DoParseResults
 	$parsedResultsData = ReadConfFile($parsedResultsDataFile);
 	$parsedResultsData->{'resultparser-stdout-file'} = $resultParserStdoutFilename;
 	$parsedResultsData->{'resultparser-stderr-file'} = $resultParserStderrFilename;
+	foreach my $k (grep /^#/, keys %$parsedResultsData)  {
+	    delete $parsedResultsData->{$k};
+	}
     }  elsif (!$state)  {
 	$state = 1;
 	$shortMsg = '';
