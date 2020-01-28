@@ -1,4 +1,10 @@
 -------------------------------------
+C-assess  version 1.2.2 (Jan 26, 2020)
+-------------------------------------
+- support negative epoch seconds and negative time differences; will not occur
+  in normal operation, but can if the clock is not set or goes backwards
+
+-------------------------------------
 C-assess  version 1.2.1 (Jan 16, 2020)
 -------------------------------------
 - Improved low-level provisioning code to include additional diagnostic

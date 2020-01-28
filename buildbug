@@ -26,7 +26,7 @@ use Cwd;
 use Time::HiRes qw( gettimeofday );
 use Data::Dumper;
 
-my $buildBugVersion = '1.2.1 (Jan 16, 2020)';
+my $buildBugVersion = '1.2.2 (Jan 27, 2020)';
 my $fwName = 'c-assess';
 my $fwVersion = $buildBugVersion;
 $fwVersion =~ s/ .*$//;
@@ -2334,10 +2334,11 @@ sub SplitTs
     my $ts = shift;
     my ($s, $m);
 
-    if ($ts =~ /^(\d+)\.(\d*)$/)  {
+    if ($ts =~ /^(([-]?)\d+)\.(\d*)$/)  {
 	$s = 0 + $1;
-	$m = 0 + substr("${2}000000", 0, 6);
-    }  elsif ($ts =~ /^(\d+)$/)  {
+	$m = 0 + substr("${3}000000", 0, 6);
+	$m *= -1 if $2 eq '-';
+    }  elsif ($ts =~ /^([-]?\d+)$/)  {
 	$s = 0 + $1;
 	$m = 0;
     }  else  {
@@ -2352,7 +2353,13 @@ sub JoinTs
 {
     my ($s, $m) = @_;
 
-    return sprintf "%d.%06d", $s, $m;
+    my $sign = '';
+    if ($s < 0 || $m < 0)  {
+	$sign = '-';
+	$s *= -1;
+	$m *= -1;
+    }
+    return sprintf "%s%d.%06d", $sign, $s, $m;
 }
 
 
@@ -2376,12 +2383,21 @@ sub DiffTs
 
     my ($startS, $startMicroS) = SplitTs($startTs);
     my ($stopS, $stopMicroS) = SplitTs($stopTs);
+    my $microsPerSec = 1000000;
 
     my ($s, $m) = ($stopS - $startS, $stopMicroS - $startMicroS);
 
-    if ($m < 0)  {
+    while ($m < 0)  {
 	--$s;
-	$m += 1000000;
+	$m += $microsPerSec;
+    }
+    if ($m >= $microsPerSec)  {
+	++$s;
+	$m -= $microsPerSec;
+    }
+    if ($s < 0 && $m < 0)  {
+	++$s;
+	$m -= $microsPerSec;
     }
 
     return JoinTs($s, $m);
