@@ -1,4 +1,10 @@
 -------------------------------------
+C-assess  version 1.2.3 (Feb 10, 2020)
+-------------------------------------
+- fix so that for all tools the 'assess' task's status is 'SKIP' if there are
+  no compilations
+
+-------------------------------------
 C-assess  version 1.2.2 (Jan 26, 2020)
 -------------------------------------
 - support negative epoch seconds and negative time differences; will not occur

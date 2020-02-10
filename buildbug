@@ -26,7 +26,7 @@ use Cwd;
 use Time::HiRes qw( gettimeofday );
 use Data::Dumper;
 
-my $buildBugVersion = '1.2.2 (Jan 27, 2020)';
+my $buildBugVersion = '1.2.3 (Feb 10, 2020)';
 my $fwName = 'c-assess';
 my $fwVersion = $buildBugVersion;
 $fwVersion =~ s/ .*$//;
@@ -3882,45 +3882,48 @@ sub DoClangSaAssessment
     my $buildFile = "$resultsDir/buildCmds$id.sh";
 
     my ($ccCmd, $cxxCmd) = WriteBuildFile($data, $buildFile);
-    mkdir $outputDir, 0755 or die "mkdir $outputDir: $!";
-    my @cmd = ($toolPath,
-		'-o', $outputDir,
-		'-plist-html',
-		'--keep-empty',
-		@$extraOpts,
-		'--use-analyzer', $clangPath);
-    push @cmd, '--use-cc', $ccCmd if defined $ccCmd;
-    push @cmd, '--use-c++', $cxxCmd if defined $cxxCmd;
-    push @cmd, $buildFile;
 
-    print STDERR "cd ", BashQuote($buildRootDir), " ; ", GetCmdString(\@cmd), "\n";
+    if (defined $ccCmd || defined $cxxCmd)  {
+	mkdir $outputDir, 0755 or die "mkdir $outputDir: $!";
+	my @cmd = ($toolPath,
+		    '-o', $outputDir,
+		    '-plist-html',
+		    '--keep-empty',
+		    @$extraOpts,
+		    '--use-analyzer', $clangPath);
+	push @cmd, '--use-cc', $ccCmd if defined $ccCmd;
+	push @cmd, '--use-c++', $cxxCmd if defined $cxxCmd;
+	push @cmd, $buildFile;
 
-    my $startTs = GetCurTs();
-    my ($exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus)
-	    = ExecCmd(\@cmd, undef, undef, $stdoutPath, $stderrPath);
-    my $stopTs = GetCurTs();
-    if ($exitStatus == 0)  {
-	++$pass;
-    }  else  {
-	++$fail;
-	print STDERR "# Error: ", GetExecErrorMsg(\@cmd, $exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus), "\n";
+	print STDERR "cd ", BashQuote($buildRootDir), " ; ", GetCmdString(\@cmd), "\n";
+
+	my $startTs = GetCurTs();
+	my ($exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus)
+		= ExecCmd(\@cmd, undef, undef, $stdoutPath, $stderrPath);
+	my $stopTs = GetCurTs();
+	if ($exitStatus == 0)  {
+	    ++$pass;
+	}  else  {
+	    ++$fail;
+	    print STDERR "# Error: ", GetExecErrorMsg(\@cmd, $exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus), "\n";
+	}
+
+	my $resultFileName;
+	opendir DIR, $outputDir or die "opendir $outputDir: $!";
+	while (my $dir = readdir DIR)  {
+	    next if $dir =~ /^\.\.?$/;
+	    die "ERROR in DoCLangSaAssessment: found multiple directories in clang output directory ($outputDir):"
+		    . "  $resultFileName, $outputDirName/$dir" if defined $resultFileName;
+	    $resultFileName = "$outputDirName/$dir";
+	}
+	closedir DIR or die "closedir $outputDir: $!";
+	die "ERROR in DoCLangSaAssessment: no directory found in clang output directory ($outputDir)"
+		unless $pass == 0 || defined $resultFileName;
+
+	print $asFH XmlAssessment($cmd[0], \@cmd, \%ENV, $buildRootDir,
+				    $resultFileName, $stdoutFileName, $stderrFileName, $id,
+				    $exitCode, $exitSignalName, $startTs, $stopTs, $indent2);
     }
-
-    my $resultFileName;
-    opendir DIR, $outputDir or die "opendir $outputDir: $!";
-    while (my $dir = readdir DIR)  {
-	next if $dir =~ /^\.\.?$/;
-	die "ERROR in DoCLangSaAssessment: found multiple directories in clang output directory ($outputDir):"
-		. "  $resultFileName, $outputDirName/$dir" if defined $resultFileName;
-	$resultFileName = "$outputDirName/$dir";
-    }
-    closedir DIR or die "closedir $outputDir: $!";
-    die "ERROR in DoCLangSaAssessment: no directory found in clang output directory ($outputDir)"
-	    unless $pass == 0 || defined $resultFileName;
-
-    print $asFH XmlAssessment($cmd[0], \@cmd, \%ENV, $buildRootDir,
-				$resultFileName, $stdoutFileName, $stderrFileName, $id,
-				$exitCode, $exitSignalName, $startTs, $stopTs, $indent2);
 
     my $assessStopTs = GetCurTs();
 
@@ -3965,6 +3968,10 @@ sub DoGccWarnAssessment
 	    $toolVersion = $ver;
 	}
     }
+
+    # if no builds occurred then their is no gcc to get version
+    $toolVersion = 'UNKNOWN' unless defined $toolVersion;
+
     $toolConf->{'#toolVersionText'} = $toolVersion;
 
     my $asFile = "$resultsDir/assessment_summary.xml";
@@ -4440,29 +4447,30 @@ sub DoParasoftCtestAssessment
     my ($ccCmd, $cxxCmd) = WriteCpptestAssessCmdsFile($data, $assessCmdsFile, $cpptestscanCmdPath,
 			$toolPath, $toolMajorVersion, $localsettingsFile, $bdfFile, $projName,
 			$testConfig, $jvmOpts, $workspaceDir, $reportDir, $resultsDir);
-    my $gccPath = $ccCmd;
-    $gccPath = $cxxCmd unless defined $ccCmd;
-    die "gcc command not found" unless defined $gccPath;
 
-    my $gccVersion = $data->{cmdInfo}{$gccPath}{version};
-    my $gccBits = $data->{cmdInfo}{$gccPath}{bits};
-    my $gccFamily;
-    if ($gccVersion =~ /^(\d+)\.(\d+)/)  {
-	$gccFamily = "gcc_${1}";
-	# only major version if >= 5.0.0
-	$gccFamily .= "_${2}" if $1 <= 4;
-	$gccFamily .= "-64" if $gccBits == 64;
-    }  else  {
-	die "Unknown gcc version format: $gccVersion";
-    }
+    if (defined $ccCmd || defined $cxxCmd)  {
+	my $gccPath = $ccCmd;
+	$gccPath = $cxxCmd unless defined $ccCmd;
 
-    my ($dtpServer, $dtpPort, $dtpUser, $dtpPassword);	#jk
-    open LOCALSETTINGS, ">", $localsettingsPath or die "open >$localsettingsFile: $!";
-    if ($toolMajorVersion <= 9)  {
-	my $ctestLicenseHost = $toolOptions{'tool-ps-ctest-license-host'};
-	my $ctestLicensePort = $toolOptions{'tool-ps-ctest-license-port'};
+	my $gccVersion = $data->{cmdInfo}{$gccPath}{version};
+	my $gccBits = $data->{cmdInfo}{$gccPath}{bits};
+	my $gccFamily;
+	if ($gccVersion =~ /^(\d+)\.(\d+)/)  {
+	    $gccFamily = "gcc_${1}";
+	    # only major version if >= 5.0.0
+	    $gccFamily .= "_${2}" if $1 <= 4;
+	    $gccFamily .= "-64" if $gccBits == 64;
+	}  else  {
+	    die "Unknown gcc version format: $gccVersion";
+	}
 
-	print LOCALSETTINGS <<EOF;
+	my ($dtpServer, $dtpPort, $dtpUser, $dtpPassword);	#jk
+	open LOCALSETTINGS, ">", $localsettingsPath or die "open >$localsettingsFile: $!";
+	if ($toolMajorVersion <= 9)  {
+	    my $ctestLicenseHost = $toolOptions{'tool-ps-ctest-license-host'};
+	    my $ctestLicensePort = $toolOptions{'tool-ps-ctest-license-port'};
+
+	    print LOCALSETTINGS <<EOF;
 bdf.import.location = $projDir
 bdf.import.compiler.family = $gccFamily
 cpptest.license.use_network = $licenseUseNetwork
@@ -4470,14 +4478,14 @@ cpptest.license.network.host = $ctestLicenseHost
 cpptest.license.network.port = $ctestLicensePort
 cpptest.license.network.edition = $licenseNetworkEdition
 EOF
-    }  else  {
-	my $dtpServer = $toolOptions{'tool-ps-ctest-dtp-server'};
-	my $dtpPort = $toolOptions{'tool-ps-ctest-dtp-port'};
-	my $dtpUser = $toolOptions{'tool-ps-ctest-dtp-user'};
-	my $dtpPassword = $toolOptions{'tool-ps-ctest-dtp-password'};
-	my $reportFormat = $toolOptions{'tool-ps-ctest-report-format'};
+	}  else  {
+	    my $dtpServer = $toolOptions{'tool-ps-ctest-dtp-server'};
+	    my $dtpPort = $toolOptions{'tool-ps-ctest-dtp-port'};
+	    my $dtpUser = $toolOptions{'tool-ps-ctest-dtp-user'};
+	    my $dtpPassword = $toolOptions{'tool-ps-ctest-dtp-password'};
+	    my $reportFormat = $toolOptions{'tool-ps-ctest-report-format'};
 
-	print LOCALSETTINGS <<EOF;
+	    print LOCALSETTINGS <<EOF;
 cpptest.compiler.family = $gccFamily
 cpptest.license.use_network = $licenseUseNetwork
 cpptest.license.network.type = $licenseNetworkType
@@ -4488,43 +4496,45 @@ dtp.user = $dtpUser
 dtp.password = $dtpPassword
 report.format = $reportFormat
 EOF
-    }
-    close LOCALSETTINGS or die "close $localsettingsPath: $!";
-
-    my @cmd = ($assessCmdsFile);
-
-    print STDERR GetCmdString(\@cmd), "\n";
-
-    # ps-ctest 10 does not always exit non-0 on failure, so also check for output XML file
-    my $resultFileName = "report.xml";
-    my $resultFullFilePath = "$reportDir/$resultFileName";
-
-    my $startTs = GetCurTs();
-    my ($exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus)
-	    = ExecCmd(\@cmd, undef, undef, $stdoutPath, $stderrPath);
-    my $stopTs = GetCurTs();
-    if ($exitStatus == 0 && -f $resultFullFilePath)  {
-	++$pass;
-    }  else  {
-	++$fail;
-	if ($exitStatus != 0)  {
-	    print STDERR "# Error: ", GetExecErrorMsg(\@cmd, $exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus), "\n";
-	}  else  {
-	    print STDERR "# Error: ", GetCmdString(\@cmd), " failed to create $resultFullFilePath\n";
 	}
-	my $licenseFailure = CheckParasoftLicenseFailure($exitCode, $stderrPath);
-	# ps-ctest 10 write license failure to stdout, so check it also if not in stderr
-	CheckParasoftLicenseFailure($exitCode, $stdoutPath) unless $licenseFailure;
-	CheckParasoftCompatibility($exitCode, $stdoutPath);
+	close LOCALSETTINGS or die "close $localsettingsPath: $!";
+
+	my @cmd = ($assessCmdsFile);
+
+	print STDERR GetCmdString(\@cmd), "\n";
+
+	# ps-ctest 10 does not always exit non-0 on failure, so also check for output XML file
+	my $resultFileName = "report.xml";
+	my $resultFullFilePath = "$reportDir/$resultFileName";
+
+	my $startTs = GetCurTs();
+	my ($exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus)
+		= ExecCmd(\@cmd, undef, undef, $stdoutPath, $stderrPath);
+	my $stopTs = GetCurTs();
+	if ($exitStatus == 0 && -f $resultFullFilePath)  {
+	    ++$pass;
+	}  else  {
+	    ++$fail;
+	    if ($exitStatus != 0)  {
+		print STDERR "# Error: ", GetExecErrorMsg(\@cmd, $exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus), "\n";
+	    }  else  {
+		print STDERR "# Error: ", GetCmdString(\@cmd), " failed to create $resultFullFilePath\n";
+	    }
+	    my $licenseFailure = CheckParasoftLicenseFailure($exitCode, $stderrPath);
+	    # ps-ctest 10 write license failure to stdout, so check it also if not in stderr
+	    CheckParasoftLicenseFailure($exitCode, $stdoutPath) unless $licenseFailure;
+	    CheckParasoftCompatibility($exitCode, $stdoutPath);
+	}
+
+	my $resultFilePath = $reportDir;
+	$resultFilePath =~ s/.*\///;
+	$resultFilePath .= "/$resultFileName";
+
+	print $asFH XmlAssessment($cmd[0], \@cmd, \%ENV, $buildRootDir,
+				    $resultFilePath, $stdoutFileName, $stderrFileName, $id,
+				    $exitCode, $exitSignalName, $startTs, $stopTs, $indent2);
+
     }
-
-    my $resultFilePath = $reportDir;
-    $resultFilePath =~ s/.*\///;
-    $resultFilePath .= "/$resultFileName";
-
-    print $asFH XmlAssessment($cmd[0], \@cmd, \%ENV, $buildRootDir,
-				$resultFilePath, $stdoutFileName, $stderrFileName, $id,
-				$exitCode, $exitSignalName, $startTs, $stopTs, $indent2);
 
     my $assessStopTs = GetCurTs();
 
@@ -5327,76 +5337,78 @@ EOF
     my $stderrPath = "$resultsDir/$stderrFileName";
     my $assessCmdsFile = "$resultsDir/assessCmds$id.sh";
 
-    WriteCsonarBuildFile($data, $assessCmdsFile);
+    my $compilerData = WriteCsonarBuildFile($data, $assessCmdsFile);
 
-    my %compilers;
-    my $cmdInfo = $data->{cmdInfo};
-    foreach my $path (keys %$cmdInfo)  {
-	$path =~ s/^.*\///;
-	if ($path =~ /(g(cc|\+\+))/)  {
-	    my $type = $1;
-	    $type = 'gpp' if $type eq 'g++';
-	    next if $path =~ /^g(cc|\+\+)$/;
-	    $compilers{$path} = $type;
+    if (%$compilerData)  {
+	my %compilers;
+	my $cmdInfo = $data->{cmdInfo};
+	foreach my $path (keys %$cmdInfo)  {
+	    $path =~ s/^.*\///;
+	    if ($path =~ /(g(cc|\+\+))/)  {
+		my $type = $1;
+		$type = 'gpp' if $type eq 'g++';
+		next if $path =~ /^g(cc|\+\+)$/;
+		$compilers{$path} = $type;
+	    }
 	}
-    }
-    if (%compilers)  {
-	@cmd = ($toolPath, 'create-conf', $csonarProj);
+	if (%compilers)  {
+	    @cmd = ($toolPath, 'create-conf', $csonarProj);
+	    print STDERR GetCmdString(\@cmd), "\n\n";
+	    ExecCmdAndFail(\@cmd, undef, undef, $stdoutPath, $stderrPath);
+
+	    my $confFile = "$csonarProj.conf";
+	    die "$confFile from create-conf does not exist" unless -f $confFile;
+
+	    open CONF, ">>", $confFile or die "open $confFile: $!";
+	    print CONF "\n\n";
+	    foreach my $p (keys %compilers)  {
+		my $type = $compilers{$p};
+		my $compilerModel = "COMPILER_MODELS += $p -> $type\n";
+		print CONF $compilerModel;
+		print STDERR "Appending to $confFile: $compilerModel";
+	    }
+	    close CONF or die "close $confFile: $!";
+	}
+
+	@cmd = ($toolPath,
+		    'analyze',
+		    $csonarProj,
+		    '-foreground',
+		    $csonarHubHostPort,
+		    $assessCmdsFile);
+
+	print STDERR "cd ", BashQuote($buildRootDir), " ; ", GetCmdString(\@cmd), "\n";
+
+	my $startTs = GetCurTs();
+	my ($exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus)
+		= ExecCmd(\@cmd, undef, undef, $stdoutPath, $stderrPath);
+	my $stopTs = GetCurTs();
+	if ($exitStatus == 0)  {
+	    ++$pass;
+	}  else  {
+	    ++$fail;
+	    print STDERR "# Error: ", GetExecErrorMsg(\@cmd, $exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus), "\n";
+	}
+
+
+	# fetch results
+	my $resultsDirName = "results$id";
+	my $resultsDirPath = "$resultsDir/$resultsDirName";
+	my $analysisFile = GetCodeSonarWarnings "http://$csonarHubHostPort", $resultsDirPath;
+	my $analysisFilePath = "$resultsDirName/$analysisFile";
+
+	print $asFH XmlAssessment($cmd[0], \@cmd, \%ENV, $buildRootDir,
+				    $analysisFilePath, $stdoutFileName, $stderrFileName, $id,
+				    $exitCode, $exitSignalName, $startTs, $stopTs, $indent2);
+
+
+	# stop hub
+	@cmd = ( $toolPath, 'hub-stop', $csonarHubHostPort );
 	print STDERR GetCmdString(\@cmd), "\n\n";
-	ExecCmdAndFail(\@cmd, undef, undef, $stdoutPath, $stderrPath);
-
-	my $confFile = "$csonarProj.conf";
-	die "$confFile from create-conf does not exist" unless -f $confFile;
-
-	open CONF, ">>", $confFile or die "open $confFile: $!";
-	print CONF "\n\n";
-	foreach my $p (keys %compilers)  {
-	    my $type = $compilers{$p};
-	    my $compilerModel = "COMPILER_MODELS += $p -> $type\n";
-	    print CONF $compilerModel;
-	    print STDERR "Appending to $confFile: $compilerModel";
-	}
-	close CONF or die "close $confFile: $!";
+	my $stopStdoutPath = "$resultsDir/hub_stop_stdout.out";
+	my $stopStderrPath = "$resultsDir/hub_stop_stderr.out";
+	ExecCmdAndFail(\@cmd, undef, undef, $stopStdoutPath, $stopStderrPath);
     }
-
-    @cmd = ($toolPath,
-		'analyze',
-		$csonarProj,
-		'-foreground',
-		$csonarHubHostPort,
-		$assessCmdsFile);
-
-    print STDERR "cd ", BashQuote($buildRootDir), " ; ", GetCmdString(\@cmd), "\n";
-
-    my $startTs = GetCurTs();
-    my ($exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus)
-	    = ExecCmd(\@cmd, undef, undef, $stdoutPath, $stderrPath);
-    my $stopTs = GetCurTs();
-    if ($exitStatus == 0)  {
-	++$pass;
-    }  else  {
-	++$fail;
-	print STDERR "# Error: ", GetExecErrorMsg(\@cmd, $exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus), "\n";
-    }
-
-
-    # fetch results
-    my $resultsDirName = "results$id";
-    my $resultsDirPath = "$resultsDir/$resultsDirName";
-    my $analysisFile = GetCodeSonarWarnings "http://$csonarHubHostPort", $resultsDirPath;
-    my $analysisFilePath = "$resultsDirName/$analysisFile";
-
-    print $asFH XmlAssessment($cmd[0], \@cmd, \%ENV, $buildRootDir,
-				$analysisFilePath, $stdoutFileName, $stderrFileName, $id,
-				$exitCode, $exitSignalName, $startTs, $stopTs, $indent2);
-
-
-    # stop hub
-    @cmd = ( $toolPath, 'hub-stop', $csonarHubHostPort );
-    print STDERR GetCmdString(\@cmd), "\n\n";
-    my $stopStdoutPath = "$resultsDir/hub_stop_stdout.out";
-    my $stopStderrPath = "$resultsDir/hub_stop_stderr.out";
-    ExecCmdAndFail(\@cmd, undef, undef, $stopStdoutPath, $stopStderrPath);
 
     my $assessStopTs = GetCurTs();
 
@@ -5725,33 +5737,35 @@ sub DoSynopsysCoverityAssessment
     my $htmlOutput = "$resultsDir/results${id}_html";
     my $emacsOutput = "$resultsDir/results$id.emacs";
 
-    WriteSynopsysCoverityAssessCmdsFile($data, $assessCmdsFile,
+    my $buildCommands = WriteSynopsysCoverityAssessCmdsFile($data, $assessCmdsFile,
 				    $covConfig, $covDataDir,
 				    $covConfigure, $covTranslate, $covAnalyze, $extraAnalyzeOpts,
 				    $covFormatErrors, $jsonOutput, $htmlOutput, $emacsOutput);
 
-    my @cmd = ($assessCmdsFile);
+    if (%$buildCommands)  {
+	my @cmd = ($assessCmdsFile);
 
-    print STDERR GetCmdString(\@cmd), "\n";
+	print STDERR GetCmdString(\@cmd), "\n";
 
-    my $startTs = GetCurTs();
-    my ($exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus)
-	    = ExecCmd(\@cmd, undef, undef, $stdoutPath, $stderrPath);
-    my $stopTs = GetCurTs();
-    if ($exitStatus == 0)  {
-	++$pass;
-    }  else  {
-	++$fail;
-	print STDERR "# Error: ", GetExecErrorMsg(\@cmd, $exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus), "\n";
-	CheckCoverityLicenseFailure($exitCode, $stderrPath);
+	my $startTs = GetCurTs();
+	my ($exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus)
+		= ExecCmd(\@cmd, undef, undef, $stdoutPath, $stderrPath);
+	my $stopTs = GetCurTs();
+	if ($exitStatus == 0)  {
+	    ++$pass;
+	}  else  {
+	    ++$fail;
+	    print STDERR "# Error: ", GetExecErrorMsg(\@cmd, $exitCode, $exitSignal, $exitSignalName, $exitErrnoMsg, $exitStatus), "\n";
+	    CheckCoverityLicenseFailure($exitCode, $stderrPath);
+	}
+
+	my $resultFileName = $jsonOutput;
+	$resultFileName =~ s/.*\///;
+
+	print $asFH XmlAssessment($cmd[0], \@cmd, \%ENV, $buildRootDir,
+				    $resultFileName, $stdoutFileName, $stderrFileName, $id,
+				    $exitCode, $exitSignalName, $startTs, $stopTs, $indent2);
     }
-
-    my $resultFileName = $jsonOutput;
-    $resultFileName =~ s/.*\///;
-
-    print $asFH XmlAssessment($cmd[0], \@cmd, \%ENV, $buildRootDir,
-				$resultFileName, $stdoutFileName, $stderrFileName, $id,
-				$exitCode, $exitSignalName, $startTs, $stopTs, $indent2);
 
     my $assessStopTs = GetCurTs();
 
