@@ -1,4 +1,15 @@
 -------------------------------------
+C-assess  version 1.2.4 (May 20, 2020)
+-------------------------------------
+- low-level provisioning code tries to change the ownership of the output
+  files using several methods in the case of an abnormal exit
+- changed name of configure output files from configure_std{out,err}.out
+  to config_std{out,err}.out
+- renamed build.conf key:  no-build-failures -> source-compiles 
+- add missing keys and values to build.conf: build-stderr-file,
+  build-stdout-file, config-stderr-file, config-stdout-file
+
+-------------------------------------
 C-assess  version 1.2.3 (Feb 10, 2020)
 -------------------------------------
 - fix so that for all tools the 'assess' task's status is 'SKIP' if there are

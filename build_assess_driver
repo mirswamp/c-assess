@@ -26,7 +26,7 @@ use Getopt::Long;
 use Time::HiRes qw( gettimeofday );
 
 
-my $buildAssessDriverVersion = '1.2.3 (Feb 10, 2020)';
+my $buildAssessDriverVersion = '1.2.4 (May 20, 2020)';
 my %options;
 my $statusFile;
 
@@ -1505,7 +1505,9 @@ sub DoPreAssess
 
 sub DoBuild
 {
-    my ($pkgData, $buildbugCmd, $configureStdout, $configureStderr) = @_;
+    my ($pkgData, $buildbugCmd, $buildStdout, $buildStderr, $configStdout, $configStderr) = @_;
+
+    my %extraConf;
 
     DoMkdir($buildBaseDir) if !-d $buildBaseDir;
     DoChdir($buildBaseDir);
@@ -1532,7 +1534,15 @@ sub DoBuild
 	    $startTs = GetCurTs();
 	    eval {
 		DoChdir($dir, 'config-dir') if defined $dir;
-		PrintAndExecCmdAndFail($cmd, undef, undef, $configureStdout, $configureStderr);
+		if (defined ($configStdout))  {
+		    $extraConf{'config-stdout-file'} = $configStdout;
+		    $configStdout = BuildFile($configStdout);
+		}
+		if (defined ($configStderr))  {
+		    $extraConf{'config-stderr-file'} = $configStderr;
+		    $configStderr = BuildFile($configStderr);
+		}
+		PrintAndExecCmdAndFail($cmd, undef, undef, $configStdout, $configStderr);
 	    };
 	    $stopTs = GetCurTs();
 	    $dur = DiffTs($startTs, $stopTs);
@@ -1553,6 +1563,7 @@ sub DoBuild
 		($dir, $cmd) = MakeBuildCmd($pkgData);
 		my $buildRootDir = ConcatPaths($pkgDir, $dir);
 		$sourceCompilesFile = 'source-compiles.xml';
+		$extraConf{'source-compiles'} = $sourceCompilesFile;
 		my $sourceCompilesPath = OutFile($sourceCompilesFile);
 		my $shortMsgFile = 'no-build-helper-msg.out';
 		my $shortMsgPath = BuildFile($shortMsgFile);
@@ -1599,6 +1610,8 @@ sub DoBuild
 		}  else  {
 		    $cmd = AppendToBashCmd($buildbugCmd, $cmd);
 		}
+		$extraConf{'build-stdout-file'} = $buildStdout if defined $buildStdout;
+		$extraConf{'build-stderr-file'} = $buildStderr if defined $buildStderr;
 	    }
 	    eval {PrintAndExecCmdAndFail($cmd)};
 	    $stopTs = GetCurTs();
@@ -1617,8 +1630,6 @@ sub DoBuild
     eval {
 	DoChdir($homeDir);
 
-	my %extraConf;
-	$extraConf{'no-build-failures'} = $sourceCompilesFile if defined $sourceCompilesFile;
 	ArchiveCreate('build', 'build', 'build-summary',
 			'build_summary.xml', \%extraConf);
     };
@@ -1928,8 +1939,10 @@ sub DoRun
     my $buildbugFile = InFile('buildbug');
     my $buildbugStraceFile = BuildFile('strace.out');
     my $buildbugBuildSummaryFile = BuildFile('build_summary.xml');
-    my $buildbugStdout = BuildFile('build_stdout.out');
-    my $buildbugStderr = BuildFile('build_stderr.out');
+    my $buildStdout = 'build_stdout.out';
+    my $buildbugStdout = BuildFile($buildStdout);
+    my $buildStderr = 'build_stderr.out';
+    my $buildbugStderr = BuildFile($buildStderr);
     my $buildbugDebug = BuildFile('buildbug.out');
 
     my $startTs = GetCurTs();
@@ -1999,10 +2012,10 @@ sub DoRun
 	    my $pkgVersion = $pkgData->{'package-version'};
 	    $buildbugCmd = AppendToBashCmd($buildbugCmd, ["--pkg-version=$pkgVersion"]) if defined $pkgVersion;
 	}
-	my $configureStdout = BuildFile('configure_stdout.out');
-	my $configureStderr = BuildFile('configure_stderr.out');
+	my $configStdout = 'config_stdout.out';
+	my $configStderr = 'config_stderr.out';
 	# DoBuild also does assess for now.
-	eval {DoBuild($pkgData, $buildbugCmd, $configureStdout, $configureStderr)};
+	eval {DoBuild($pkgData, $buildbugCmd, $buildStdout, $buildStderr, $configStdout, $configStderr)};
 	if (ShouldStatusLog($@))  {
 	    $@ = LogStatus('misc', 'DoBuild', 1, undef, $@);
 	}
