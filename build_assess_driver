@@ -26,7 +26,7 @@ use Getopt::Long;
 use Time::HiRes qw( gettimeofday );
 
 
-my $buildAssessDriverVersion = '1.2.4 (May 20, 2020)';
+my $buildAssessDriverVersion = '1.2.6 (May 22, 2020)';
 my %options;
 my $statusFile;
 
@@ -181,18 +181,22 @@ sub DiffTs
 
     my ($s, $m) = ($stopS - $startS, $stopMicroS - $startMicroS);
 
+    # m is (-2*microsPerSec, 2*microsPerSec)
     while ($m < 0)  {
 	--$s;
 	$m += $microsPerSec;
     }
+    # m is [0, 2*microsPerSec)
     if ($m >= $microsPerSec)  {
 	++$s;
 	$m -= $microsPerSec;
     }
-    if ($s < 0 && $m < 0)  {
+    # m is [0, 1*microsPerSec)
+    if ($s < 0 && $m > 0)  {
 	++$s;
 	$m -= $microsPerSec;
     }
+    # m is [0, 1*microsPerSec), if s>0, else (-1*microsPerSec, 0]
 
     return JoinTs($s, $m);
 }

@@ -1,4 +1,14 @@
 -------------------------------------
+C-assess  version 1.2.6 (May 22, 2020)
+-------------------------------------
+- fix a bug that causes a failure if the clock on the host goes backwards
+
+-------------------------------------
+C-assess  version 1.2.5 (May 21, 2020)
+-------------------------------------
+- fix a bug that causes a failure if the clock on the host goes backwards
+
+-------------------------------------
 C-assess  version 1.2.4 (May 20, 2020)
 -------------------------------------
 - low-level provisioning code tries to change the ownership of the output
