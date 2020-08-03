@@ -1,0 +1,140 @@
+#!/bin/bash
+
+straceVersion=4.10
+version=
+outDir=
+updatePlatform=
+straceTar=
+tmpBuildDir=
+tmpNoArchBuildDir=
+tmpInFilesBuildDir=
+cAssessTar=
+
+function ErrorExit()
+{
+    local code=$1 message=$2
+    local program=$(basename $0)
+
+    echo "ERROR: $program $message"
+    exit "$code"
+}
+
+
+function Run()
+{
+    echo "=====   $*"
+    "$@"
+    r=$?
+    echo
+    if [ $r -ne 0 ]; then
+	echo "ERROR: command failed with exit code $r:  $*"
+	echo
+    fi
+    return $r
+}
+
+
+function RunExitOnFail()
+{
+    Run "$@"
+    r=$?
+    if [ $r -ne 0 ]; then
+	exit $r
+    fi
+}
+
+
+function ValidateAndInit()
+{
+    if [ $# -ne 2 ]; then
+	ErrorExit 1 "Usage: $0 <output-dir> <version>"
+    fi
+
+    cAssessDir=$(dirname ${BASH_SOURCE[0]})/..
+    cAssessReleaseFilesDir=$cAssessDir/release_files
+    cAssessNoarchDir=$cAssessReleaseFilesDir/noarch
+    cAssessInFilesDir=$cAssessNoarchDir/in-files
+    cAssessCAssessConf=$cAssessInFilesDir/c-assess.conf
+
+    outDir=$1
+    version=$2
+
+    if [ -z "$SWAMP_FRAMEWORK_DEPENDENCIES" ]; then
+	SWAMP_FRAMEWORK_DEPENDENCIES=/p/swamp/frameworks
+	export SWAMP_FRAMEWORK_DEPENDENCIES
+	if [ ! -d "$SWAMP_FRAMEWORK_DEPENDENCIES" ]; then
+	    ErrorExit 1 "required environment variable SWAMP_FRAMEWORK_DEPENDENCIES not set"
+	fi
+    fi
+
+    if [ ! -d "$SWAMP_FRAMEWORK_DEPENDENCIES" ]; then
+	ErrorExit 1 "ERROR: SWAMP_FRAMEWORK_DEPENDENCIES directory not found $SWAMP_FRAMEWORK_DEPENDENCIES"
+    fi
+
+    if [ ! -f "$cAssessCAssessConf" ]; then
+	ErrorExit 1 "expected file missing:  $cAssessCAssessConf"
+    fi
+
+    updatePlatform="$SWAMP_FRAMEWORK_DEPENDENCIES/platform/update-platform"
+    cAssessConf=$cAssessDir/
+    straceVersion=$(perl -e '
+			while (<>) {
+			    if (/^\s*strace-base\s*=\s*(.*)\s*$/) {
+				print "$1\n";
+				exit;
+			    }
+			}
+			exit 1;
+		    ' "$cAssessCAssessConf")
+    straceTar="$SWAMP_FRAMEWORK_DEPENDENCIES/c/$straceVersion-arch.tar"
+    tmpBuildDirName="c-assess-$version"
+    tmpBuildDir="$outDir/$tmpBuildDirName"
+    tmpBuildNoArchDir="$tmpBuildDir/noarch"
+    tmpBuildInFilesDir="$tmpBuildNoArchDir/in-files"
+    md5sumFile="$tmpBuildDir/md5sum"
+    cAssessTar="$tmpBuildDir.tar.gz"
+
+    for f in "$updatePlatform" "$straceTar"; do
+	if [ ! -f $f ]; then
+	    ErrorExit 1 "missing expected file:  $f"
+	fi
+    done
+
+    if [ ! -d "$outDir" ]; then
+	ErrorExit 1 "missing output-dir:  $outDir"
+    fi
+
+    for f in "$tmpBuildDir" "$cAssessTar"; do
+	if [ -e "$f" ]; then
+	    ErrorExit 1 "file must not exist:  $f"
+	fi
+    done
+}
+
+
+function main()
+{
+    ValidateAndInit "$@"
+
+    RunExitOnFail cp -r -p  "$cAssessReleaseFilesDir" "$tmpBuildDir"
+    RunExitOnFail cp -r -p  "$straceTar" "$tmpBuildInFilesDir/"
+    RunExitOnFail "$updatePlatform" --dir "$tmpBuildInFilesDir"
+    ( cd $tmpBuildDir && md5sum $(find -type f \! -name md5sum | sort ) )> $md5sumFile
+    r=$?
+    if [ $r -ne 0 ]; then
+	ErrorExit "$r" "md5sum failed with exit code $r"
+    fi
+    RunExitOnFail chmod -R a+rX "$tmpBuildDir"
+    RunExitOnFail tar -C $outDir -c -z -f "$cAssessTar" "$tmpBuildDirName"
+    RunExitOnFail rm -rf "$tmpBuildDir"
+
+    if [ ! -f "$cAssessTar" ]; then
+        ErrorExit 1 "build successful but archive missing:  $cAssessTar"
+    fi
+
+    echo
+    echo "Success.  Created $cAssessTar"
+}
+
+
+main "$@"

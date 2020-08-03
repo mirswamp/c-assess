@@ -1,0 +1,147 @@
+#!/bin/sh
+
+## Network Up
+## Simplified Network UP
+##
+## Copyright  2010, 2012, 2014, 2015, 2016 by:
+##
+##     Bolo --- Josef T. Burger
+##
+## All rights reserved.
+##
+## Simplified Network UP may be freely used as long as credit 
+## is given to the above authors and the above copyright is maintained.
+
+## Simplied Network UP is a ...
+## special version of Network UP to be used for the automated VMs in
+## the SWAMP -- The SoftWare Assurance Market Place.
+## It is used to verify that the swamp VM's network interface
+## has an ipv4 address assigned to it.   If the interface lacks
+## an address, that means that something has failed in the
+## swamp VM infrastructure.
+##
+## The run.sh script uses this to abort so that an assessment
+## due to temporary network failures can be retried.
+
+p=`basename $0`
+
+IF=eth0
+grep=grep
+AM4='inet addr:'
+ip4="ipv4"
+
+for bin in "$VMINPUTDIR" "`dirname $0`"; do
+	os="$bin/get-platform"
+	echo "os=$os"
+	if [ -x "$os" ]; then
+		break
+	else
+		os=
+	fi
+done
+if [ -z "$os" ]; then
+	echo $p: Can not find get-platform 1>&2
+	exit 1
+fi
+
+os=`$bin/get-platform`
+## don't worry about errors it might work, worst
+## case is that network is down and we fix it.
+case $os in
+fedora-*)
+	## fedora acts like bsd
+	AM4='inet [0-9]+\.[0-9]+'
+	grep=egrep
+	;;
+rhel-7.*|centos-7.*|scientific-7.*)
+	## same as fedora
+	## el7 acts like bsd
+	AM4='inet [0-9]+\.[0-9]+'
+	grep=egrep
+	;;
+esac
+
+## some pre-auto generated SWAMP VMs don't have standardized device naming.
+## Try to detect that situation and use the biosdevname interface instead.
+if [ -d /sys/class/net/ens3 ] ; then
+	IF=ens3
+fi
+
+AM=$AM4
+AMT=$ip4
+
+default_delay=60
+MAX_DELAY=$default_delay
+
+## probe on a regular basis, and keep track of when it comes up
+probe_interval=10
+
+while [ $# -gt 0 ] ; do
+	case $1 in
+	-d)
+		MAX_DELAY=$2
+		shift
+		;;
+	-i)
+		IF=$2
+		shift
+		;;
+	[0-9]*)
+		MAX_DELAY=$1
+		break
+		;;
+	esac
+	shift
+done
+
+sleep_time=0
+
+## best way to force an iteration
+if [ $MAX_DELAY -eq 0 ] ; then
+	MAX_DELAY=1
+elif [ $MAX_DELAY -lt 0 ] ; then
+	echo $p: "$MAX_DELAY": bogus delay, default to $default_delay 1>&2
+	MAX_DELAY=$default_delay
+fi
+
+## makes it easy on the verbose output
+if [ $probe_interval -gt $MAX_DELAY ] ; then
+	probe_interval=$MAX_DELAY
+fi
+
+up=0
+
+while [ $sleep_time -lt $MAX_DELAY ] ; do
+	ifconfig $IF | $grep -q "$AM"
+	up=$?
+	if [ $up -eq 0 ] ; then
+		break
+	fi
+
+	sleep $probe_interval
+	sleep_time=`expr $sleep_time + $probe_interval`
+
+	## adjust next sleep time
+	nw=`expr $sleep_time + $probe_interval`
+	if [ $nw -gt $MAX_DELAY ] ; then
+		x=`expr $nw - $MAX_DELAY`
+		probe_interval=`expr $probe_interval - $x`
+	fi
+done
+
+
+exit_code=0
+xx="UP"
+if [ $up -ne 0 ] ; then
+	exit_code=1
+	xx="DOWN"
+fi
+
+if [ $sleep_time -ne 0 ] ; then
+	echo $p: DELAYED $sleep_time net $AMT if $IF status $xx
+else
+	## "x" is so parsers for both cases identical
+	echo $p: NODELAY x  net $AMT if $IF  status $xx
+fi
+
+exit $exit_code

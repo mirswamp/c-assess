@@ -1,0 +1,222 @@
+#! /bin/sh
+
+## get-platform.sh
+
+## Originally by Vamshi Basupalli
+## Modified and Maintained by Bolo -- Josef T. Burger 2015-2016
+
+
+## Get a swamp-platform identifier of the form
+## os-version.number-bits
+## currently works on fedora, el5 & el6, ubuntu and debian
+
+## A lot of code is original legacy code which works, and it
+## is being left alone for now.
+
+p=`basename $0`
+
+use_lsb=
+family=false
+
+while [ $# -gt 0 ] ; do
+	case $1 in
+	--lsb|--use-lsb)
+		use_lsb=true
+		;;
+	--no-lsb)
+		use_lsb=
+		;;
+	--family)
+		## squash rhel centos scientific -> el
+		family=true
+		;;
+	*)
+		echo $p: $1: unkown opt/arg 1>&2
+		exit 1
+		;;
+	esac
+	shift
+done
+
+
+## Determine bit size of machine
+
+bits=unknown
+mach_type=`uname --machine`
+case $mach_type in
+x86_64|amd64)
+	bits=64
+	;;
+i686)
+	bits=32
+	;;
+*)
+	echo $p: $mach_type: unknown architecture 1>&2
+	echo "unknown-swamp-bits"
+	exit 1
+	;;
+esac
+
+
+platform=unknown
+version=unknown
+
+RedhatRelease='/etc/redhat-release'
+DebianRelease='/etc/debian_version'
+
+## Is LSB available?   It is a fallback method, or can be used explicitly
+lsbrel=`which lsb_release 2>/dev/null`
+if [ -n "$use_lsb" -a -z "$lsbrel" ] ; then
+	use_lsb=
+	echo $p: lsb unavailable, reverting to traditional 1>&2
+fi
+
+if [ -z "$use_lsb" -a -f ${RedhatRelease} ] ; then
+	## sed -r is not compliant
+	if egrep -q '^Red Hat Enterprise Linux Server release [0-9.]+ \([^)]+\)' ${RedhatRelease} ; then
+		version=$(sed -n -r 's:^Red Hat Enterprise Linux Server release ([0-9.]+) \([^)]+\):\1:p' ${RedhatRelease})
+		platform="rhel"
+	elif egrep -q '^Scientific Linux release [0-9.]+ \([^)]+\)' ${RedhatRelease} ; then
+		version=$(sed -n -r 's:^Scientific Linux release ([0-9.]+) \([^)]+\):\1:p' ${RedhatRelease})
+		#version=$(cat ${RedhatRelease} | awk '{ print $4}')
+		platform="scientific"
+	elif egrep -q '^CentOS.* release [0-9.]+ \([^)]+\)' ${RedhatRelease} ; then
+		# CentOS release   OR  CentOS Linux release
+		version=$(sed -n -r 's:^CentOS.* release ([0-9.]+) \([^)]+\):\1:p' ${RedhatRelease})
+		## starting with centos 7, date tagged versions
+		case $version in
+		*.*.*)
+			version=`expr "$version" : '\([0-9]*\.[0-9]*\)\..*'`
+			;;
+		esac
+
+		#version=$(cat ${RedhatRelease} | awk '{ print $4}')
+		platform="centos"
+		
+	elif egrep -q '^Fedora release [0-9]+' ${RedhatRelease} ; then
+		platform=fedora
+		version=$(sed -n -r 's:^Fedora release ([0-9.]+) \([^)]+\):\1:p' ${RedhatRelease})
+		## XXX could check for '.' if they ever do sub-versions
+		## XXX swamp now does versions as fedora does
+		# version="${version}.0"
+	else
+		echo "unknown-redhat-release"
+		exit 1
+	fi
+
+	## version crunching for now for updates to match dependencies
+	## which is causing more work
+	#case $version in
+	#5.11)	version=5.9	;;
+	#6.7)	version=6.4	;;
+	#20)	version=19.0	;;
+	#esac
+
+elif [ -z "$use_lsb" -a -f ${DebianRelease} ] ; then
+
+	## N.M where N,M 0..9 or or x/y where x, == string
+	code=`awk 'NR == 1 { print $1;}' ${DebianRelease}`
+
+	case "$code" in
+	[0-9].[0-9]|[0-9].[0-9][0-9])	## breaks at debian 10
+		platform=debian
+		## XXX should probably be head or a grep/sed extractor
+		## as found above.
+		version="$code"
+
+		## version crunching for now for updates to match dependencies
+		## Version crunching of debian 7.1 left on for now, since
+		## we actually have 7.1 but call it 7.0 through the SWAMP
+		case $version in
+		7.1)		version=7.0	;;
+		esac
+		;;
+
+	*/sid)
+		platform=ubuntu
+		t=`expr "$code" : '\([^/]*\)/.*'`
+		## XXX x.10 versions and non-lts have same code names;
+		##  need to use lsb to distinguish 
+		## 18.04  bionic     buster / sid
+		## 16.04  xenial     stretch / sid
+		## 15.10  wily       jessie  / sid
+		## 15.04  vivid      jessie  / sid
+		## 14.10  utopic     jessie  / sid
+		## 14.04  trusty     jessie  / sid
+		## 13.10  saucy      wheezy  / sid
+		## 13.04  raring     wheezy  / sid
+		## 12.10  quantal    wheezy  / sid
+		## 12.04  precise    wheezy  / sid
+		## 11.10  oneiric    wheezy  / sid
+		## 11.04  natty      squeeze / sid
+		## 10.10  maverick   squeeze / sid
+		## 10.04  lucid      squeeze / sid
+		case "$t" in
+		squeeze)	version=10.04	;;	## lucid - natty
+		wheezy)		version=12.04	;;	## precise - saucy
+		jessie)		version=14.04	;;	## trusty - wily
+		stretch)	version=16.04	;;	## xenial - ???
+		buster)		version=18.04	;;	## bionic
+		*)
+			echo $p: "$code": release code 1>&2
+			echo "unknown-ubuntu-release"
+			exit 1
+			;;
+		esac
+		;;
+	*/*)
+		echo $p: "$code": unexpected ubuntu release code 1>&2
+		echo "unknown-ubuntulike-release"
+		exit 1
+		;;
+	*)	
+		echo $p: "$code": unexpected debian release code 1>&2
+		echo "unknown-debian-release"
+		exit 1
+		;;
+	esac
+
+	## XXX ubuntu recommends ALWAYS using lsb_release to get this info
+	## instead of doing stuff like this.
+	## That's because the names often encompass multiple versions of the
+	## OS.
+
+elif [ -n "$use_lsb" ] ; then
+
+	## Use the LSB system to get OS/version info
+
+	## Distributor ID: Scientific
+	platform=`lsb_release --id | awk '{print \$NF;}' | tr A-Z a-z`
+	
+	case "$platform" in
+	redhatenterpriseserver)
+		platform=rhel
+		;;
+	esac
+
+	## Release:	   14.04
+	version=`lsb_release --release | awk '{print \$2;}'`
+
+	## Version crunching not performed because we don't know
+	## what is happening here and want 100% accurate output.
+
+else
+	echo "unknown-swamp-platform"
+	exit 1
+fi
+
+## XXX could move version crunching here to support known platforms,
+## regardless of traditional or lsb platform determination.
+
+## turn different vendors into "el" enterprise linux os.
+if $family ; then
+	case $platform in
+	rhel|centos|scientific)
+		platform=el
+		;;
+	esac
+fi
+
+sys_type="${platform}-${version}-${bits}"
+echo ${sys_type}
+exit 0

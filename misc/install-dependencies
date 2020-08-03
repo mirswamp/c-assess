@@ -1,0 +1,501 @@
+#! /bin/sh
+
+p=`basename $0`
+
+## improve logging from these tools for non-interactive sessions
+export TERM=dumb
+
+## Return values
+## 0 == success or nothing to do
+## 1 == something failed	"FAIL"
+## 2 == nothing to install	"SKIP"
+##	only if --skip specified by the invoker
+
+## --init just initializes the package system in case other activityies
+## must work correctly 
+
+skip_error=false			## --skip
+do_nothing=				## -n
+init_only=false				## -init
+pkg_list=				## packages to install
+platform_only=false			## --platform
+
+## Really there is OK, generic failure, system failure, and skip
+
+## this is here so it can be available for running jobs multiple
+## times by hand on a vm or a testbed.
+if false ; then
+	echo $p: dependencies already installed, shortcut exit
+	exit 0
+fi
+
+use_errs=false
+
+while [ $# -gt 0 ] ; do
+	case $1 in
+	--skip)
+		skip_error=true
+		;;
+	--init)
+		init_only=true
+		;;
+	--platform)
+		platform_only=true
+		;;
+	-n)
+		do_nothing=echo
+		;;
+	-*)
+		echo $p: $1: unkown opt 1>&2
+		use_errs=true
+		;;
+	*)
+		break
+	esac
+	shift
+done
+
+only_only=false
+if $init_only ; then	
+	only_only=true
+fi
+if $platform_only ; then
+	only_only=true
+fi
+
+if [ $only_only != true  -a  $# -eq 0 ] ; then
+	echo $p: dependency-file missing 1>&2
+	use_errs=true
+elif [ $# -gt 1 ] ; then
+	echo $p: multiple dependency-files not supported 1>&2
+	use_errs=true
+elif [ $only_only != true ] ; then
+	dependencies_list_file="$1"
+	## empty dependencies is valid
+	if [ ! -r "$dependencies_list_file" ] ; then
+		echo $p: "$dependencies_list_file": missing or unreadable 1>&2
+		exit 1
+	fi
+
+fi
+
+if $use_errs ; then
+	echo usage: $p '[--skip]' dependency-file
+	exit 1
+fi
+
+
+
+## the debian package system is broken; it should run on a "teletype"
+## aka a dumb terminal, but then it breaks "default" answers w/ -y,
+## so this is a hack to sorta make things work w/out errors.
+## Quite possibly the bug is fixed, but we don't update ubuntu
+if [ -f /etc/debian_version  -a  x"$TERM" = x"dumb" ] ; then
+	TERM=linux
+fi
+
+get_platform=get-platform
+
+vmin=/mnt/in
+if [ -n "$VMINPUTDIR" ] ; then
+	vmin="$VMINPUTDIR"
+elif [ -x $get_platform ] ; then
+	## make debugging easy
+	vmin=.
+elif [ -x `dirname $0`/$get_platform ] ; then
+	vmin=`dirname $0`
+elif [ -x "$get_platform".sh ] ; then
+	## legacy invocation
+	## make debugging easy
+	vmin=.
+	get_platform="$get_platform".sh
+fi
+
+## could be more sophisticated and look in a list of places
+
+get_platform=${vmin}/$get_platform
+if [ ! -x $get_platform ] ; then
+	ls -l $get_platform
+	echo $p: $get_platform: missing 1>&2
+	exit 1
+fi
+
+
+pkgInstallInit=
+pkgInstallCmd=
+
+Platform="`$get_platform`"
+
+## this is a hack for something which is going away
+if $platform_only ; then
+	echo $Platform
+	exit 0
+fi
+
+echo $p: ${Platform}
+
+
+## Only use sudo if it is needed
+if [ `id -u` -eq 0 ] ; then
+	asroot=
+else
+	asroot=sudo
+fi
+
+## XXX yum repolist is a good init command, it fixes a myriad of sins
+## and gives early failure detection
+
+## the yum repolist happens as part of the install otherwise; we are
+## better off refreshing the repolist explicitly or dieing
+## XXX don't do this until we can do it based on recent load
+# redhat_init="$asroot yum -y repolist"
+redhat_init=
+redhat_install="$asroot yum install -q -y"
+redhat_like="redhat"
+
+redhat7_init="$asroot yum makecache -q -y fast"
+redhat7_install="$redhat_install"
+redhat7_like="redhat7"
+
+debian_init="$asroot apt-get -q -y update"
+debian_install="$asroot apt-get -q -y install"
+debian_install_pkg="$asroot dpkg -i -E --refuse-downgrade"
+debian_like="debian"
+
+### xx newer fedora has different toolset, which is yum compatible
+
+## XX really want to turn OS into an install family, that's in the future
+case ${Platform} in
+	fedora-*)
+		family=$redhat_like
+		;;
+	rhel-7.*)
+		family=$redhat7_like
+		;;
+	rhel-*)
+		family=$redhat_like
+		;;
+	scientific-7.*)
+		family=$redhat7_like
+		;;
+	scientific-*)
+		family=$redhat_like
+		;;
+	centos-7.*)
+		family=$redhat7_like
+		;;
+	centos-*)
+		family=$redhat_like
+		;;
+	debian-*)
+		family=$debian_like
+		;;
+	ubuntu-*)
+		family=$debian_like
+		;;
+	*)
+		echo $p: $platform: unknown platform 1>&2
+		exit 1
+		;;
+esac
+
+case $family in
+	$redhat_like)
+		pkgInstallInit="$redhat_init"
+		pkgInstallCmd="$redhat_install"
+		;;
+	$redhat7_like)
+		pkgInstallInit="$redhat7_init"
+		pkgInstallCmd="$redhat7_install"
+		;;
+	$debian_like)
+		pkgInstallInit="$debian_init"
+		pkgInstallCmd="$debian_install"
+		pkgInstallCmd_pkg="$debian_install_pkg"
+		;;
+esac
+
+#echo $pkgInstallInit
+#echo $pkgInstallCmd
+
+
+if [ $init_only = false  ] ; then
+	## regex target for the dependencies
+	target="^dependencies-${Platform}" 
+	deps="$dependencies_list_file"
+	## [ space tab ]  portable between all seds
+	## this merges the MULTIPLE dep-plat=dep possible into ONE pkg_list
+	## courtesty of shell handling.
+	pkg_list=`grep "$target" ${deps} | sed -e "s/${target}=[ 	]*//"`
+fi
+
+## XXX we might want to do the key update anyway, because if a package
+## tries to 'yum install' something it will fail on the old VMs
+
+## Nothing to do ... in some cases
+if [ $init_only = false  -a  -z "${pkg_list}" ] ; then
+	s=0
+	if $skip_error ; then
+		s=2
+	fi
+	exit $s
+fi
+
+## XXX if redhat7, need to init NOW
+		
+## XXX need to fix epel key problems
+if [ $family = $redhat_like ] ; then
+	## EPEL is all updates because its keys are out of date
+	## and our existing VMs have bogus databases on them
+	## to fall back on which causes secondary errors
+	## Need to turn epel off to get new certificates so
+	## epel will work.
+
+	update_cacerts=true
+
+	## not found otw; some platforms don't have them (el5)
+	## XXX error message capture worthwhile?
+	cacert=`rpm -q ca-certificates 2>/dev/null`
+	s=$?
+	if [ $s -ne 0 ] ; then
+		echo $p: ca-certificates package not found 1>&2
+		update_cacerts=false
+	fi
+
+	if $update_cacerts ; then
+		year=`expr "$cacert" : 'ca-certificates-\([0-9]*\)\..*'`
+		## NO magic numbers, want recent date..
+		this_year=`date '+%Y'`
+		## a year old is good for most keys, more than that is not
+		## that gives a max two year window (Jan 2015 -> Dec 2016 zB)
+		last_year=`expr $this_year - 1`
+		if [ "$year" -lt "$last_year" ] ; then
+			:
+		else
+			update_cacerts=false
+		fi
+		echo $p: ca-cert: $cacert
+	fi
+
+	if $update_cacerts ; then
+		echo $p: ==== FIX-CA-CERTS ==== `date`
+		
+		## if epel isn't installed, we might get away w/out updating
+		## they keys.   Some distros have keys from 2010 in them,
+		## and we are approaching a typical key cutoff date.
+
+		if [ ! -f /etc/yum.repos.d/epel.repo ] ; then
+			## Not an issue if epel is not available; it
+			## should be on most el grade platforms.
+			## In particular:
+			## SWAMP rhel6 platforms have a non-standard epel
+			## generated by a channel on the MIR satellite.
+			## Some SWAMP scientific platforms don't have epel
+			disable=
+		else
+			disable="--disablerepo=epel"
+		fi
+
+		cmd="$asroot yum upgrade -q -y ca-certificates $disable"
+		echo $p: $cmd
+		$do_nothing $cmd
+		s=$?
+
+		## could soft-fail here; if it is a hard failure we will fail
+		## later .. or we might succeed
+		if [ $s -ne 0 ] ; then
+			echo $p: status=$s: FIX-CA-CERTS failed 1>&2
+			echo $p: continuing
+#			echo $p: continuing blindly like before 1>&2
+#			exit 1
+		fi
+	fi
+
+fi
+
+## XXX --init should update the lists, but we can't do that nicely
+## on redhat, because it doesn't have a good timestamp to base that on.
+
+## Nothing to do, again
+if $init_only ; then
+	exit 0
+fi
+		
+
+## XXX on redhat this is works right if run twice, overkill on debian
+## who doesn't check timestamps to see if a new fetch is needed
+
+## XX however when a repo is installed, always need to get the list,
+## since we just added a new source of updates.
+
+do_init=true
+if [ $family = $debian_like ] ; then
+	## A day is plenty.  -mmin +30 would be 30 minutes
+	## If it exists, rely on it to be accurate
+	t=/var/lib/apt/periodic/update-success-stamp 
+	if [ -f $t ] ; then
+		old=`find $t -mtime +1 2>&1`
+		s=$?
+		if [ $s -eq 0  -a  -z "$old" ] ; then
+			echo $p: packages initialized recently, skipping
+			ls -l $t
+			do_init=false
+		elif [ $s -ne 0 ] ; then
+			echo $p: skippable error: "$old" 1>&2
+		fi
+	fi
+fi
+
+## Yum can deal with both package-names and packages.
+## apt-get get only deals with package-names
+## two solutions to this
+##   1) make the archives available in /var/cache/apt/archives/
+##   2) run dpkg -i -E
+##      (if a real machine)  apt-get install -f  to fix broken-ness
+pkg_list_local=
+repolist=
+if [ $family = $debian_like ] ; then
+	echo $p: filtering packages for package-files
+
+	pkg_list_normal=
+
+	for pkg in $pkg_list ; do
+		case $pkg in
+		*.deb)
+			pkg_list_local="$pkg_list_local $pkg"
+			;;
+		REPO:*)
+			repo=`expr "$pkg" : 'REPO:\(.*\)'`
+			repolist="$repolist $repo"
+			;;
+		*)
+			pkg_list_normal="$pkg_list_normal $pkg"
+			;;
+		esac
+	done
+	if [ -n "$pkg_list_local" ] ; then
+		echo $p: local: "$pkg_list_local"
+	fi
+	if [ -n "$pkg_list_normal" ] ; then
+		echo $p: normal: "$pkg_list_normal"
+	fi
+	pkg_list="$pkg_list_normal"
+fi
+
+## debian/ubuntu only for now
+
+if [ -n "$repolist" ] ; then
+	echo $p: ==== ADD-REPOSITORIES ==== `date`
+	
+	## it's name changes, but add-apt-rep is backwards compatabile in 14
+	if add_repo=`which apt-add-repository 2>/dev/null` ; then
+		:
+	elif add_repo=`which add-apt-repository 2>/dev/null` ; then
+		:
+	else
+		echo $p: apt-add-repository command not found 1>&2
+		echo $p: INSTALL FAILURE CANT ADD REPOSITORY
+		exit 1
+	fi
+
+	add_repo_cmd="$asroot $add_repo -y"
+
+	## and now we need to install all the new repos
+	for repo in $repolist ; do
+		echo $p: -- repo $repo --
+		if $add_repo_cmd $repo ; then
+			:
+		else
+			echo $p: repo install failed, status=$s
+			## continue to let normal error handling work
+			## it will error out when packages can't be
+			## found, and a informative error message about
+			## all missing repos will be logged
+		fi
+	done
+
+	## always need to update  after adding repositoies
+	do_init=true
+
+	echo $p: ==== DONE ==== `date`
+fi
+
+## simplify logic
+if [ -z "$pkgInstallInit" ] ; then
+	do_init=false
+fi
+
+## XXX what if this should be run regardless of packages to install?
+if $do_init ; then
+	echo $p: ==== INIT ==== `date`
+	echo $p: init: "$pkgInstallInit"
+	$do_nothing $pkgInstallInit
+	s=$?
+	if [ $s -ne 0 ] ; then
+		echo $p: status=$s: init failed 1>&2
+#			echo $p: continuing blindly like before 1>&2
+		exit 1
+	fi
+fi
+
+	
+
+## XXX improve logic and nesting here, and really need to do a better
+## job with dpkg -i because it is a multi-pass procedure to take care
+## of fixing dependencies for those local files, which yum takes care
+## of for us automatically
+
+## if dpkg -i -E pkgs ; then
+##	OK
+## elif apt-get install -f ; then
+##      dpkg -i -E pkgs
+## fi
+
+
+if [ -n "$pkgInstallCmd" ] ; then
+
+	## all packages could be local now
+	if [ -n "$pkg_list" ] ; then
+		echo $p: ==== INSTALL ==== `date`
+		echo $p: install: "$pkgInstallCmd"
+		echo $p: packages: "${pkg_list}"
+		$do_nothing ${pkgInstallCmd} ${pkg_list}
+		s=$?
+		if [ $s -ne 0 ] ; then
+			echo $p: status=$s: install failed 1>&2
+			exit 1
+		fi
+		echo $p: ==== DONE ==== `date`
+	fi
+
+	## XXX this is only for debian dpkg/apt-get
+	if [ -n "$pkg_list_local" ] ; then
+		echo $p: ==== INSTALL-LOCAL ==== `date`
+		echo $p: install: "$pkgInstallCmd_pkg"
+		echo $p: packages: "${pkg_list_local}"
+
+#		$do_nothing ${pkgInstallCmd_pkg} ${pkg_list_local}
+
+		# This is how to properly do it, but it is not tested
+		# apt-get update -f tries to fix broken packages on a system
+		# so we can retry a local install which failed due to some
+		# previous but automatically fixable failure
+		if $do_nothing ${pkgInstallCmd_pkg} ${pkg_list_local} ; then
+			:
+		elif $do_nothing ${pkgInstallCmd} -f ; then
+			$do_nothing ${pkgInstallCmd_pkg} ${pkg_list_local}
+		fi
+		s=$?
+		if [ $s -ne 0 ] ; then
+			echo $p: status=$s: install failed 1>&2
+			exit 1
+		fi
+		echo $p: ==== DONE ==== `date`
+	fi
+else
+	echo $p: no install cmd and packages to install 1>&2
+	exit 1
+fi
+
+
+exit 0

@@ -1,0 +1,16 @@
+NOTE: begin                                                                     
+PASS: install-os-dependencies                                         49.178988s
+PASS: tool-unarchive                                                   6.847141s
+PASS: package-unarchive                                                2.357813s
+PASS: configure                                                       34.450174s
+PASS: build                                                          482.655832s
+PASS: build-trace-decode                                             129.394241s
+PASS: assess (pass: 1, fail: 0)                                     4095.417317s
+PASS: buildbug                                                      4711.329127s
+PASS: build-archive                                                   39.199081s
+PASS: results-archive                                                  8.463055s
+PASS: resultparser-unarchive                                           0.057007s
+PASS: parse-results (weaknesses: 474)                                  6.472111s
+PASS: parsed_results-archive                                           0.012001s
+PASS: all                                                           4858.409332s
+NOTE: end                                                                       

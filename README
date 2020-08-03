@@ -1,0 +1,23 @@
+                           c-assess repository README
+                                  Aug 1, 2020
+
+This is the SWAMP (Software Assurance Markeplace) C/C++ Framework repository.
+
+Buliding a release of this framework requires the SWAMP framework dependencies
+directory.  To make a release run the following commands:
+
+    mkdir -p <output-dir>
+    export SWAMP_FRAMEWORK_DEPENDENCIES=<path-to-swamp-framekwork-dependencies>
+    util/make_swamp_release <output-dir> <version>
+
+This will create the c-assess-<version>.tar.gz framework archive.
+
+
+Synopsis of files:
+
+    README                     this file
+    util/make_swamp_release    script to create a release
+    release_files/             files used in a release
+    misc/                      current versions of files from the swamp
+                                 framework dependencies (these are informational
+                                 actual and are not used to create the release)
